@@ -1,0 +1,35 @@
+{
+  "backup_interval": 3600, 
+  "use_internal_gateway": 1, 
+  "network_address": {
+    "test_controller": {
+      "ip": "localhost",
+      "port": 1691
+    },
+    "packet_forwarder": {
+      "ip": "",
+      "port": 1690
+    },
+    "network_server": {
+      "ip": "52.3.215.147",
+      "port": 20000
+    }, 
+    "error_report": {
+      "ip": "3.16.33.6",
+      "port": 1692
+    }
+  },
+  "gateway_id": "353530321C005000", 
+  "folder": {
+    "cache": "cache",
+    "backup": "db",
+    "power": "tmp\/power"
+  },
+  "file": {
+    "database_proxy": "tmp\/db_proxy.db",
+    "database_controller": "tmp\/db_tc.db",
+    "database_backup": "db\/db_backup.db",
+    "database_power": "db\/db_pm.db"
+  }, 
+  "deduplication_threshold": 0.1
+}
