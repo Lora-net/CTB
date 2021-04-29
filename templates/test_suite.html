@@ -1,0 +1,164 @@
+<div class="container">
+    {% from 'test_details.html' import test_table %}
+
+    <h2>Semtech Validated Test Suite (v6 July 2020)</h2>
+    <p>Please refer to the test results to see the parameters and
+        what calculated values were used in the verification. Complex
+        inputs from the manufacturer are repeated here to show original
+        source information.</p>
+
+        <h3>2.1 Power</h3>
+
+        <h4>2.1.1 Predicted Battery Life</h4>
+
+        <p>This test estimates battery life based on observing device
+            operation for 48 hours. Goal is to check estimates against manufacturer’s
+            claims. Currently hampered by inability to measure micro-amps accurately.</p>
+
+        <p>Category: <b>power</b> Sub-Category: <b>battery_life</b></p>
+        <p>Parameter table: <b>powerSpec</b></p>
+        <div>
+            <p class="text-left"><b>  Expected Battery Life -- Parameters</b></p>
+            <ul>
+                <li>Usable battery capacity: {{ powerSpecRow['UsableCapacity'] }} mAh</li>
+                <li>Typical self discharge: {{ powerSpecRow['TypicalSelfDischarge'] * 100 }} % per month</li>
+                <li>Maximum allowable discharge: {{ powerSpecRow['MaxDischarge'] * 100 }} % of full capacity</li>
+                <li>Sleep mode current: {{ powerSpecRow['CurrentSleepMode'] }} mA</li>
+                <li>Maximum power consumption: {{ powerSpecRow['MaxPower'] }} mA</li>
+                <li>Replacement voltage: {{ powerSpecRow['ReplacementVoltage'] }} V</li>
+            </ul>
+        </div>
+
+        {{ test_table('power','battery_life', testRows) }}
+
+        <h4>2.1.2 Transmission (Tx) Power</h4>
+
+        <p>The device must support LoRa Alliance test mode.The device transmit power levels are checked
+            in a shielded chamber against manufacturer’s data. Rough estimates only, goal
+            is to confirm a monotonic reduction in RF transmit power level in line with
+            claims.</p>
+
+        <p>Category: <b>power</b> Sub-Category: <b>tx_power</b></p>
+        <p>Parameter table: <b>TxSteps</b> list from <b>regionSKU</b> table</p>
+        <p><b>{{ skuRow['TxSteps'] }}</b></p>
+        {{ test_table('power','tx_power', testRows) }}
+
+        <h3>2.2 Industrial Design</h3>
+
+        <h4>2.2.1 Labelling: QR Code </h4>
+
+        <p>The manufacturer’s QR Code, if available, is evaluated
+            against their claims.</p>
+
+        <p>Category: <b>manual</b> Sub-Category: <b>qrcode</b></p>
+        <p>Parameter table: <b>qrCode</b></p>
+        {{ test_table('manual','qrcode',testRows) }}
+
+        <h3>2.3 Operation</h3>
+
+        <h4>2.3.1 Expected Uplinks per Day </h4>
+
+        <p>This test validates the number of expected uplinks per day,
+            without any external trigger. Test runs for over 48 hours and results are
+            averaged.</p>
+
+        <p>Category: <b>operation</b> Sub-Category: <b>uplinks_number</b></p>
+        <p>Parameter table: <b>upLink</b></p>
+
+        <div>
+            <p class="text-left"><b>  Expected Up Links -- Parameters</b></p>
+            <ul>
+                <li>Uplinks per day: {{ upLinkRow['UpLinksperDay'] }}</li>
+                <li>Periodic uplink?: {% if upLinkRow['PeriodicUpLink']==1 %}Yes{% else %}No{% endif %}</li>
+                <li>Period: {{ upLinkRow['UpLinkPeriod'] }}</li>
+                <li>Is the period customizable?: {% if upLinkRow['UpLinkPeriodCustomizable']==1 %}Yes{% else %}
+                    No{% endif %}</li>
+                <li>Uplink period custom comment: {{ upLinkRow['UpLinkPeriodCustomReference'] }}</li>
+            </ul>
+        </div>
+
+        {{ test_table('operation','uplinks_number', testRows) }}
+
+        <h4>2.3.2 Repetition of DevNonce</h4>
+
+        <p>This test validates that the DevNonces
+            used in the join procedure do not repeat in 40 power cycles of 20 joins each
+            (800 join attempts).</p>
+
+        <p>Category: <b>operation</b> Sub-Category: <b>devnonce_repetition</b></p>
+        <p>Parameter table: <b>N/A</b></p>
+        {{ test_table('operation','devnonce_repetition', testRows) }}
+
+        <h4>2.3.3 Retransmission Back-off</h4>
+
+        <p>For 36 hours the network’s join-accept packets are blocked from
+            reaching the device and the device behaviour is recorded. Total transmit time-on-air
+            (toa) is calculated from the result and compared against claims and the LoRa
+            Alliance specifications.</p>
+
+        <p>Category: <b>operation</b> Sub-Category: <b>retransmission_backoff</b></p>
+        <p>Parameter table: <b>joinProcess</b></p>
+        {{ test_table('operation','retransmission_backoff', testRows) }}
+
+        <h4>2.3.4 Response to loss of downlink for 24 hours</h4>
+
+        <p>For devices that expect network feedback (e.g. confirmed
+            data uplink, link checks, periodic downloads, etc.) this test checks behaviour
+            against claims when traffic from the network is blocked for 24 hours.</p>
+
+        <p>Category: <b>operation</b> Sub-Category: <b>loss_downlink</b></p>
+        <p>Parameter table: <b>networkLoss</b></p>
+        {{ test_table('operation','loss_downlink', testRows) }}
+
+        <h3>2.4 Security Key Distribution (Join Server)</h3>
+
+        <p>For devices that support join server OTAA this test
+            validates that security keys and device provisioning follow standard best
+            practices and the devices can successfully join the network following the
+            manufacturer’s documented procedures.</p>
+
+        <p>Category: <b>manual</b> Sub-Category: <b>security</b></p>
+        <p>Parameter table: <b>security</b></p>
+        {{ test_table('manual','security', testRows) }}
+
+</div>
+<div class="container">
+    <h2>Links to detailed test results</h2>
+    <table class="table">
+        <thead>
+        <tr>
+            <th>Category</th>
+            <th>Sub-Cat.</th>
+            <th>DevEUI</th>
+            <th>BenchID</th>
+            <th>FinishTime</th>
+            <th>Result</th>
+            <th>Comments</th>
+            <th>Operator</th>
+            <th>Details</th>
+        </tr>
+        </thead>
+        <tbody>
+        {% for t in testRows %}
+            <tr>
+                <td>{{ t['Cat'] }}</td>
+                <td>{{ t['SubCat'] }}</td>
+                <td>{{ t['DevEUI'] }}</td>
+                <td>{{ t['BenchID'] }}</td>
+                <td>{{ t['FinishTime']|cTime }}</td>
+                {% if t['Passed']==1 %}
+                    <td><span style='color: #008000;'>Passed</span></td>
+                {% elif t['Passed']==-3 %}
+                    <td><span style='color: #00FF00;'>Observation</span></td>
+                {% else %}
+                    <td><span style='color: #FF0000;'>Failed</span></td>
+                {% endif %}
+                <td>{{ t['Comments'] }}</td>
+                <td>{{ t['Operator'] }}</td>
+                <td style='padding: 5px 10px 5px 5px;' align='center'>
+                    <a href='/result/testid={{ t['TestInstID'] }}'>{{ t['TestInstID'] }}</a></td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>

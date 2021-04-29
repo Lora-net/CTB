@@ -4,7 +4,7 @@
 
 #Revised BSD License
 
-#Copyright Semtech Corporation 2020. All rights reserved.
+#Copyright Semtech Corporation 2021. All rights reserved.
 
 #Redistribution and use in source and binary forms, with or without
 #modification, are permitted provided that the following conditions are met:
@@ -38,17 +38,54 @@ import operator
 import os
 import lzma
 import threading
-
-import ext_verification
+import sys
+import base64
 import numpy as np
 import matplotlib.pyplot as plt
-from flask import Blueprint, send_file
-from lib_base import datrLUT, DB_FILE_BACKUP, DB_FILE_CONTROLLER, DB_FILE_PM, reverse_eui, CACHE_FOLDER, deduplication_threshold
-from lib_db import backup_db_proxy, backup_db_pm
-from datetime import datetime
+from flask import Blueprint, send_file, request, redirect, url_for
+from lib_base import datrLUT, DB_FILE_BACKUP, DB_FILE_CONTROLLER, CACHE_FOLDER, \
+    deduplication_threshold, config, TEST_STATE, CACHE_STATE
+from lib_db import backup_db_proxy, backup_db_tc, delete_records, calc_db_pm
+from datetime import datetime, timedelta
+from importlib import import_module
+
+sys.path.append("./pytest_dir")
 
 matplotlib.use('Agg')
 result_api = Blueprint('result_api', __name__)
+
+
+def generate_table(result):
+    html = '<html><table border="1"><tr>'
+    for key in result['keys']:
+        html += "<th>" + key + "</th>"
+    html += "</tr>"
+
+    for row in result['rows']:
+        for e in row:
+            html += "<td>{}</td>".format(e)
+        html += "</tr>"
+
+    html += "</table></html>"
+
+    return html
+
+
+def generate_passed_table(result):
+    html = '<html><table border="1"><tr>'
+    for key in ["Criteria", "Result", "Passed"]:
+        html += "<th>" + key + "</th>"
+    html += "</tr>"
+
+    for i in range(len(result)):
+        html += "<td>{}</td>".format(result[i][0])
+        html += "<td>{}</td>".format(result[i][1])
+        html += "<td>{}</td>".format(result[i][2])
+        html += "</tr>"
+
+    html += "</table></html>"
+
+    return html
 
 
 def get_all_packets(response):
@@ -70,21 +107,21 @@ def get_all_packets(response):
         max_time = conn.execute("SELECT MAX(time) FROM packet").fetchone()["MAX(time)"]
         
         if not max_time:
+            backup_db_tc()
             backup_db_proxy()
         else:
             if max_time < response["FinishTime"]:
+                backup_db_tc()
                 backup_db_proxy()
                 
-        dev_addrs = conn.execute('SELECT DevAddr FROM session WHERE DevEui=(?) and DevAddr is not null',
-                                 (response["DevEui"],)).fetchall()
+        dev_addrs = conn.execute('SELECT DevAddr FROM session WHERE TestInstID=(?) and DevAddr is not null',
+                                 (response["TestInstID"],)).fetchall()
         dev_addrs = [item["DevAddr"] for item in dev_addrs]
-    
-        if response["StartTime"]:
-            packets_conn = conn.execute('SELECT * FROM packet WHERE time > (?) AND time < (?) ORDER BY time',
-                                        (response["StartTime"] - 0.01, response["FinishTime"] + 0.01)).fetchall()
-        else:
-            packets_conn = []
-    
+
+        packets_conn = conn.execute('SELECT * FROM packet WHERE TestInstID=(?) ORDER BY time',
+                                        (response["TestInstID"],)).fetchall()
+        conn.close()
+
         packets = []
         
         last_up_time = 0
@@ -92,8 +129,6 @@ def get_all_packets(response):
             pkt = dict(packet)
             if pkt["json"]:
                 pkt["json"] = json.loads(pkt["json"])
-            if pkt["test"]:
-                pkt["test"] = json.loads(pkt["test"])
     
             if "error" in pkt["json"]:
                 if pkt["json"]["MType"] in ["000"]:
@@ -104,7 +139,7 @@ def get_all_packets(response):
                         if pkt["json"]["DevAddr"] in dev_addrs:
                             packets.append(pkt)
             else:
-                if pkt["json"]["DevEui"] == response["DevEui"] and pkt["direction"] == "up":
+                if pkt["direction"] == "up":
                     if "Cat" in response and response["Cat"].lower() == "rf":  # RF testbench needs test information returned for validation
                         if pkt["stat"] == 1:  # dedup happens already, single stat==1 packet can be generated
                             packets.append(pkt)
@@ -112,13 +147,13 @@ def get_all_packets(response):
                         if pkt["time"] - last_up_time > deduplication_threshold and pkt["stat"] == 0:
                             packets.append(pkt)
                     last_up_time = pkt["time"]
-    
-                if pkt["stat"] == 1 and pkt["json"]["DevEui"] == response["DevEui"] and pkt["direction"] == "down":
+
+                if pkt["stat"] == 1 and pkt["direction"] == "down":
                     packets.append(pkt)
         
         packets.sort(key=operator.itemgetter("time"))
         
-        conn.close()
+
         
         if response["UpdateTime"]:
             with lzma.open(fileName, "w") as f:
@@ -171,62 +206,48 @@ def generate_error_log(packets, response):
     return html, packets_valid
 
 
+def update_latest_result(inst):
+    if inst['Passed'] == TEST_STATE['RUNNING']:
+        conn = sqlite3.connect(DB_FILE_CONTROLLER, timeout=60)
+        conn.row_factory = sqlite3.Row
+        response = conn.execute('SELECT UpdateTime, CurrentPara FROM testInstance WHERE StartTime=(?)',
+                                 (inst['StartTime'],)).fetchone()
+        conn.close()
+        if response:
+            for key in ['UpdateTime', 'CurrentPara']:
+                inst[key] = response[key]
+
+
 @result_api.route('/result', methods=['GET', 'POST'])
 def list_tests():
-    conn = sqlite3.connect(DB_FILE_CONTROLLER, timeout=60)
-    conn.row_factory = sqlite3.Row
+    all_sequence = get_test_result()
 
-    responses = conn.execute('SELECT rowid,* FROM schedule').fetchall()
-
-    all_sequence = []
-    for response in responses:
-        all_sequence.append(dict(response))
-        all_sequence = sorted(all_sequence, key=lambda k: k['AddTime'], reverse=False)
-
-    html = '<html><table border="1"><tr>'
-    for key in ["DevEui", "Cat", "SubCat", "Criteria", "Parameter", "CurrentPara", "Config", "StartTime",
-                "FinishTime", "rowid", "Passed", "Report Ready"]:
+    html = '<html><table border="1"><script src="https://kit.fontawesome.com/a076d05399.js"></script><tr>'
+    for key in ["rowid", "DevEui", "BenchID", "Cat", "SubCat", "Criteria", "Parameter", "CurrentPara", "Config", "StartTime",
+                "FinishTime", "Passed", "Report Ready", "Comments", "Operator", "Delete"]:
         html += "<th>" + key + "</th>"
     html += "</tr>"
     
-    #response["Passed"] None: ongoing, 1: passed, -1: failed, -2: not run, -3: not implemented, -4: packet MIC error
-    
-    for response in all_sequence:
-        if (response["FinishTime"] and not response["Passed"]):
-            packets = get_all_packets(response)
-            _, packets_valid = generate_error_log(packets, response)
-            if len(packets_valid) == len(packets):
-                try:
-                    _, suc = eval("ext_verification.verify_" + response["Cat"] + "_" + response["SubCat"] + "(packets, response)")
-                    print("Verify", response["Cat"] + "_" + response["SubCat"])
-                except AttributeError:
-                    suc = -3
-            else:
-                suc = -4
-                
-            response["Passed"] = suc
-            conn.execute("UPDATE schedule SET Passed=(?) WHERE rowid=(?)", (response["Passed"], response["rowid"]))
-            conn.commit()
-    
     for response in all_sequence:
         html += "<tr>"
-        for key in ["DevEui", "Cat", "SubCat", "Criteria", "Parameter", "CurrentPara", "Config", 
-                    "StartTime", "FinishTime", "rowid", "Passed", "Ready"]:
-            if key == "rowid":
+        for key in ["TestInstID", "DevEui", "BenchID", "Cat", "SubCat", "Criteria", "Parameter", "CurrentPara", "Config",
+                    "StartTime", "FinishTime", "Passed", "Ready", "Comments", "Operator"]:
+            if key == "TestInstID":
                 html += "<td><a href='/result/testid=%d'>%d</a><br></td>" % (response[key], response[key])
                 continue
             
             if key == "DevEui":
-                html += "<td>{}</td>".format(reverse_eui(response[key]).upper())
+                html += "<td>{}</td>".format(response[key].upper())
                 continue
             
             if key == "Passed":
-                lut = {1: "<font color='green'>Passed</font>", 
-                      -1: "<font color='red'>Failed</font>", 
-                      -2: "<font color='black'>Not Tested</font>", 
-                      -3: "<font color='black'>Not Implemented</font>", 
-                      -4: "<font color='red'>Packet MIC Error</font>", 
-                      None: ""}
+                lut = {TEST_STATE['PASSED']: "<font color='green'>Passed</font>",
+                       TEST_STATE['FAILED']: "<font color='red'>Failed</font>",
+                       TEST_STATE['RUNNING']: "<font color='black'>Running</font>",
+                       TEST_STATE['ABORTED']: "<font color='orange'>Aborted</font>",
+                       TEST_STATE['OBSERVATION']: "<font color='lime'>Observation</font>",
+                       TEST_STATE['NA']: "<font color='black'>N/A</font>",
+                       None: ""}
                 response[key] = lut[response[key]]
             
             if key == "StartTime":
@@ -240,21 +261,36 @@ def list_tests():
                 else:
                     response[key] = str(datetime.fromtimestamp(response[key]))[:-7]
             if key == "Ready":
-                if response[key] == 0:
+                if response[key] == CACHE_STATE['NONE']:
                     response[key] = " "
-                if response[key] == 1:
+                if response[key] == CACHE_STATE['GENERATING']:
                     response[key] = "Generating"
-                if response[key] == 2:
+                if response[key] == CACHE_STATE['READY']:
                     response[key] = "Ready"
             html += "<td>{}</td>".format(str(response[key]))
+        html += '<td align="center"><a href = "/result/delete?rowid={}" ><i class="fas fa-trash-alt"></a></td>'.format(
+                response["TestInstID"])
         html += "</tr>"
     html += "</table></html>"
-    
-    conn.commit()
-    conn.close()
-    
+
     return html
 
+@result_api.route('/result/delete', methods=['GET'])
+def device_delete_row():
+    if 'rowid' in request.args:
+        rowid = int(request.args['rowid'])
+    else:
+        return "Error: No rowid specified."
+    try:
+        conn = sqlite3.connect(DB_FILE_BACKUP, timeout=60)
+        conn.row_factory = sqlite3.Row
+        delete_records(conn, "testInstance", 'rowid', [{"rowid": rowid}])
+        conn.commit()
+        conn.close()
+        return redirect(request.referrer)
+    except:
+        conn.close()
+        return "error device-delete"
 
 def generate_general_fig(packets, key):
     x = []
@@ -472,6 +508,28 @@ def generate_network_delay_fig(response):
     html += "<hr>"
     return html
 
+@result_api.route('/comments/edit', methods=['POST'])
+def edit_tests():
+    if request.method == 'POST':
+        result = request.form.to_dict(flat=True)
+        conn = None
+        try:
+            conn = sqlite3.connect(DB_FILE_BACKUP, timeout=60)
+            conn.row_factory = sqlite3.Row
+            conn.execute("UPDATE testInstance SET Comments=(?), Operator=(?) WHERE rowid=(?)",
+                         (result['comments'], result['operator'], int(result['rowid'])))
+            conn.commit()
+            conn.close()
+            fileName = CACHE_FOLDER + "/" + result["DevEui"] + "_" + str(result["UpdateTime"]) + "_" + "title" + ".html_xz"
+            if os.path.exists(fileName):
+                print("cache filename is {}".format(fileName))
+                os.remove(fileName)
+            cached = True
+            return redirect(request.referrer)
+        except:
+            if conn:
+                conn.close()
+            return "editting comments/operator error!"
 
 def generate_title(response):
     cached = False
@@ -489,9 +547,42 @@ def generate_title(response):
             else:
                 html += key + ":" + str(response[key]) + "<br>"
         if response["FinishTime"]:
-            html += "Duration: %f" % (response["FinishTime"] - response["StartTime"])
+            html += "Duration: {}".format(timedelta(seconds=(response["FinishTime"] - response["StartTime"])))
+        html += '<form action="/comments/edit" method="post">'
+        html += '<input type="hidden" id="rowid" name="rowid" value="{}">'.format(response['TestInstID'])
+        html += '<input type="hidden" id="DevEui" name="DevEui" value="{}">'.format(response['DevEui'])
+        html += '<input type="hidden" id="UpdateTime" name="UpdateTime" value="{}">'.format(response['UpdateTime'])
+        html += '<label for="comments">Comments:</label><br>'
+        html += '<textarea disabled="true", cols="80", rows="5", id="comments" name="comments">{}</textarea>'.format(response['Comments'])
+        html += '<br>'
+        html += '<label for="operator">Operator:</label><br>'
+        html += '<input disabled="true" type="text" size=20 id="operator" name="operator" value="{}">'.format(response['Operator'])
+        html += '<input id="submitbtn" disabled="disabled" name="Submit" type="submit" value="Submit" />'
+        html += '</form>'
+        html += '<button onclick="myFunction()">Edit</button>'
+        html += """<script>
+        function myFunction() {
+        document.getElementById("comments").disabled=false;
+        document.getElementById("operator").disabled=false;
+        document.getElementById("submitbtn").disabled=false;
+        }
+        </script>"""
         html += "<hr>"
-        
+
+        if response["Passed"] == TEST_STATE['RUNNING']:
+            html += "Test is running. Time elapsed {}<br>".format(timedelta(seconds=(time.time() - response["StartTime"])))
+        elif response["Passed"] == TEST_STATE['PASSED']:
+            html += "Test passed<br>"
+        elif response["Passed"] == TEST_STATE['FAILED']:
+            html += "Test failed, {}<br>".format(response["ErrorMsg"])
+        elif response["Passed"] == TEST_STATE['ABORTED']:
+            html += "Test aborted<br>"
+        elif response["Passed"] == TEST_STATE['OBSERVATION']:
+            html += "Test was in observation mode due to lack of information from questionnaire<br>"
+        elif response["Passed"] == TEST_STATE['NA']:
+            html += "Test not applicable<br>"
+        html += "<hr>"
+
         if response["FinishTime"]:
             with lzma.open(fileName, "w") as f:
                 f.write(html.encode())
@@ -532,17 +623,18 @@ def generate_mac_trace(packets):
     return html
 
 
-def generate_power(start, duration, detail = True):
-
+def generate_power(start, duration, detail = True, test_instid=None):
     cached = False
-    fileName = CACHE_FOLDER + "/" + "current_" + str(start) + "_" + str(duration) + "_" + str(detail) + ".html_xz"
+    if test_instid is not None:
+        fileName = CACHE_FOLDER + "/" + "current_" + str(test_instid) + "_" +str(start) + "_" + str(duration) + "_" + str(detail) + ".html_xz"
+    else:
+        fileName = CACHE_FOLDER + "/" + "current_" + str(start) + "_" + str(duration) + "_" + str(detail) + ".html_xz"
     if os.path.exists(fileName):
         cached = True
     else:
         cached = False
 
     if not cached:
-    
         start = float(start)
         duration = float(duration)
         
@@ -551,29 +643,31 @@ def generate_power(start, duration, detail = True):
         
         html = ""
         
-        conn = sqlite3.connect(DB_FILE_PM, timeout=60)
+        conn = sqlite3.connect(DB_FILE_BACKUP, timeout=60)
         conn.row_factory = sqlite3.Row
-        
-        if conn.execute('SELECT max(time) FROM power').fetchone()["max(time)"]:
-            if float(conn.execute('SELECT max(time) FROM power').fetchone()["max(time)"]) <= start + duration + 1:
-                backup_db_pm()
-        else:
-            backup_db_pm()
-        
+
         if detail:
-            currents = conn.execute('SELECT time, value FROM power WHERE duration = 1 AND time >= (?) '
+            if test_instid is None:
+                currents = conn.execute('SELECT time, value FROM power WHERE duration = 1 AND time >= (?) '
                                     'AND time < (?) ORDER BY time',
                                      (start-1, start+duration+1)).fetchall()
-        else:
-            if duration > 86400:
-                currents = conn.execute('SELECT time, average, max FROM power WHERE duration = 60 '
-                                        'AND time >= (?) AND time < (?) ORDER BY time',
-                                         (start-1, start+duration+1)).fetchall()
             else:
-                currents = conn.execute('SELECT time, average, max FROM power WHERE duration = 1 '
+                currents = conn.execute('SELECT time, value FROM power WHERE TestInstID=(?) AND '
+                                        'duration = 1 AND time >= (?) AND time < (?) ORDER BY time',
+                                        (test_instid, start-1, start+duration+1)).fetchall()
+        else:
+            if test_instid is None:
+                currents = conn.execute('SELECT time, average, max FROM power WHERE duration = (?) '
                                         'AND time >= (?) AND time < (?) ORDER BY time',
-                                         (start-1, start+duration+1)).fetchall()
-        
+                                         (60 if duration > 86400 else 1,
+                                          start-1, start+duration+1)).fetchall()
+            else:
+                currents = conn.execute('SELECT time, average, max FROM power WHERE TestInstID=(?) AND '
+                                        'duration = (?) AND time >= (?) AND time < (?) ORDER BY time',
+                                         (test_instid, 60 if duration > 86400 else 1,
+                                          start-1, start+duration+1)).fetchall()
+        conn.close()
+
         x = []
         y = []
         y1 = []
@@ -623,8 +717,6 @@ def generate_power(start, duration, detail = True):
         
         if not detail:
             ax.plot(plot_x, plot_y1)
-            
-        conn.close()
         
         ax.grid()
         ax.set_xlabel("time")
@@ -675,13 +767,12 @@ def generate_power(start, duration, detail = True):
 def generate_current(response, packets):
     html = ""
 
-    conn = sqlite3.connect(DB_FILE_PM, timeout=60)
-    conn.row_factory = sqlite3.Row
-    
     if not response["FinishTime"]:
         response["FinishTime"] = time.time()
         
-    html += generate_power(response["StartTime"] - 10, response["FinishTime"] - response["StartTime"] + 10, False)
+    html += generate_power(response["StartTime"] - 10,
+                           response["FinishTime"] - response["StartTime"] + 10,
+                           False, response['TestInstID'])
     
     html += "<br>"
 
@@ -689,25 +780,32 @@ def generate_current(response, packets):
     for key in ["MType", "datr", "Time", "Average", "Peak"]:
         html += "<th>" + key + "</th>"
     html += "</tr>"
-    
+
+    conn = sqlite3.connect(DB_FILE_BACKUP, timeout=60)
+    conn.row_factory = sqlite3.Row
     for packet in packets:
         html += "<tr>"
         html += "<td>{}</td>".format(packet["json"]["MType"])
         html += "<td>{}</td>".format(packet["datr"])
         
         if packet["direction"] == "up":
-            html += "<td><a href='/current/1/%f+%f'>%s</a></td>" % \
-                    (packet["time"]-5, 15, str(datetime.fromtimestamp(packet["time"]))[:-5])
+            html += "<td><a href='/current/testid=%d/1/%f+%f'>%s</a></td>" % \
+                    (response['TestInstID'], packet["time"]-5, 15,
+                     str(datetime.fromtimestamp(packet["time"]))[:-5])
             
-            avg = conn.execute('SELECT AVG(average) FROM power WHERE duration=1 AND time > (?) AND time < (?)',
-                               (packet["time"]-5, packet["time"]+10)).fetchone()["AVG(average)"]
+            avg = conn.execute('SELECT AVG(average) FROM power WHERE TestInstID=(?) AND '
+                               'duration=1 AND time > (?) AND time < (?)',
+                               (response['TestInstID'], packet["time"]-5,
+                                packet["time"]+10)).fetchone()["AVG(average)"]
             if avg:
                 html += "<td>%.4f</td>" % (avg/1e6)
             else:
                 html += "<td></td>"
             
-            peak = conn.execute('SELECT MAX(max) FROM power WHERE duration=1 AND time > (?) AND time < (?)',
-                                (packet["time"]-5, packet["time"]+10)).fetchone()["MAX(max)"]
+            peak = conn.execute('SELECT MAX(max) FROM power WHERE TestInstID=(?) AND '
+                                'duration=1 AND time > (?) AND time < (?)',
+                                (response['TestInstID'], packet["time"]-5,
+                                 packet["time"]+10)).fetchone()["MAX(max)"]
             if peak:
                 html += "<td>%.2f</td>" % (peak/1e6)
             else:
@@ -727,6 +825,29 @@ def generate_current(response, packets):
     return html
 
 
+def del_cache(item, response):
+    if response and response["UpdateTime"] and item != "current":
+        fileName = os.path.join(os.path.dirname(__file__), CACHE_FOLDER,
+                                response["DevEui"] + "_" + str(response["UpdateTime"]) + "_" + item + ".html_xz")
+        if os.path.exists(fileName):
+            os.remove(fileName)
+
+def generate_verification(response):
+    html = ""
+    if response and response['VerificationMsg']:
+        response['VerificationMsg'] = json.loads(response['VerificationMsg'])
+        if "verification" in response['VerificationMsg']:
+            html += generate_passed_table(response['VerificationMsg']['verification'])
+        if "details" in response['VerificationMsg']:
+            html += "<br>Details<br>"
+            html += generate_table(response['VerificationMsg']['details'])
+        if response['Picture']:
+            html += "<br>Picture<br>"
+            html += '<img alt="Product Photo" src="data:image/jpg;base64,{}" style="width:300px;">'.format(base64.b64encode(response['Picture']).decode('utf-8'))
+
+        html += "<hr>"
+    return html
+
 def plot_items(packets, items, response):
 
     html_total = ""
@@ -739,19 +860,17 @@ def plot_items(packets, items, response):
                 cached = True
         else:
             cached = False
-        
+
         if not cached:
             if not packets:
                 html = "No valid packets <hr>"
+                if item == "verification" and response and response['Cat'] == "manual":
+                    html = "<font size='5'>" + item + "</font><br>"
+                    html += generate_verification(response)
             else:
-                html = ""
-                html += "<font size='5'>" + item + "</font><br>"
-                if item == "verification" and response:
-                    try:
-                        html_local, suc = eval("ext_verification.verify_" + response["Cat"] + "_" + response["SubCat"] + "(packets, response)")
-                        html += html_local
-                    except AttributeError:
-                        html += "Verification function not implemented <br><hr>"
+                html = "<font size='5'>" + item + "</font><br>"
+                if item == "verification":
+                    html += generate_verification(response)
                 if item.find("-") >= 0:
                     keywords = item.split("-")
                     html += generate_correlation_fig(packets, keywords[0], keywords[1])
@@ -761,8 +880,6 @@ def plot_items(packets, items, response):
                     html += generate_network_delay_fig(response)
                 if item == "mac":
                     html += generate_mac_trace(packets)
-                if item == "current":
-                    html += generate_current(response, packets)
                 if item == "FRMPayload":
                     html += generate_frmpayload(packets)
                 if item in ["rssi", "lsnr", "freq", "size", "datr", "toa", "FCnt", "ACK", "FPort", "FRMPayload_length",
@@ -776,6 +893,9 @@ def plot_items(packets, items, response):
                             //-->
                             </script>
                             """
+            if item == "current":
+                html += generate_current(response, packets)
+
             if response and response["UpdateTime"] and item != "current":
                 with lzma.open(fileName, "w") as f:
                     f.write(html.encode())
@@ -787,14 +907,6 @@ def plot_items(packets, items, response):
 
 
 def generate_cache(response):
-    
-    conn = sqlite3.connect(DB_FILE_CONTROLLER, timeout=60)
-    conn.row_factory = sqlite3.Row
-    conn.execute('UPDATE schedule SET Ready = 1 WHERE rowid=(?)', (response["rowid"],))
-    conn.commit()
-    
-
-    
     html = generate_title(response)
     packets = get_all_packets(response)
     html_error, packets = generate_error_log(packets, response)
@@ -805,24 +917,43 @@ def generate_cache(response):
                  "current", "log", "delay", "mac", "FRMPayload", "rssi-freq", "lsnr-freq"]:
         plot_items(packets, item, response)
     '''    
-    conn = sqlite3.connect(DB_FILE_CONTROLLER, timeout=60)
+    conn = sqlite3.connect(DB_FILE_BACKUP, timeout=60)
     conn.row_factory = sqlite3.Row
-    conn.execute('UPDATE schedule SET Ready = 2 WHERE rowid=(?)', (response["rowid"],))
+    conn.execute('UPDATE testInstance SET Ready = 2 WHERE rowid=(?)', (response["rowid"],))
     conn.commit()
+    conn.close()
+
+
+def get_test_result(rowid=None):
+    conn = sqlite3.connect(DB_FILE_BACKUP, timeout=60)
+    conn.row_factory = sqlite3.Row
+    if not rowid:
+        responses = conn.execute('SELECT * FROM testInstance').fetchall()
+    else:
+        responses = conn.execute('SELECT * FROM testInstance WHERE rowid=(?)', (rowid,)).fetchall()
+    latest_instid = conn.execute('SELECT MAX(testInstID) FROM testInstance WHERE BenchID=(?)',
+                                 (config['gateway_id'],)).fetchone()["MAX(testInstID)"]
+    conn.close()
+
+    sequences = []
+    for response in responses:
+        inst = dict(response)
+        if inst['TestInstID'] == latest_instid:
+            update_latest_result(inst)
+        sequences.append(inst)
+
+    return sequences
 
 
 @result_api.route('/result/testid=<rowid>/<items>', methods=['GET', 'POST'])
 def open_result(rowid, items):
-    conn = sqlite3.connect(DB_FILE_CONTROLLER, timeout=60)
-    conn.row_factory = sqlite3.Row
-    response = conn.execute('SELECT * FROM schedule WHERE rowid=(?)', (rowid,)).fetchone()
-    conn.close()
-    
+    response = get_test_result(rowid)
+
     if not response:
         return "Test ID not found"
-    response = dict(response)
-        
+    response = response[0]
     if items == "cache":
+        response["rowid"] = rowid
         generate_cache(response)
         html = "Cache finished"
     else:
@@ -840,21 +971,20 @@ def open_result(rowid, items):
 
 @result_api.route('/result/testid=<rowid>', methods=['GET', 'POST'])
 def open_result_brief(rowid):
-    conn = sqlite3.connect(DB_FILE_CONTROLLER, timeout=60)
-    conn.row_factory = sqlite3.Row
-    response = conn.execute('SELECT * FROM schedule WHERE rowid=(?)', (rowid,)).fetchone()
-    conn.close()
-    
+    response = get_test_result(rowid)
+
     if not response:
         return "Test ID not found"
-    response = dict(response)
-
+    response = response[0]
     html = generate_title(response)
     packets = get_all_packets(response)
     html_error, packets = generate_error_log(packets, response)
     
     html += plot_items(packets, "verification", response)
-    
+
+    if response['Cat'] == 'manual':
+        return html
+
     html += "<font size='5'>More Information</font><br>"
     lut = {"PHY Parameters": ["rssi", "lsnr", "freq", "size", "datr", "toa", "log"], 
            "MAC Parameters": ["MType", "FCnt", "ACK", "FPort", "FRMPayload_length", "FRMPayload", "mac"], 
@@ -870,19 +1000,33 @@ def open_result_brief(rowid):
     return html
 
 
-@result_api.route('/current/<detail>/<startTime>+<duration>', methods=['GET', 'POST'])
-def open_current_time(startTime, duration, detail):
+def open_current(startTime, duration, detail, test_instid=None):
     startTime = float(startTime)
     duration = float(duration)
     detail = int(detail)
-    
+    if test_instid is not None:
+        test_instid = int(test_instid)
+
     if startTime > time.time():
         return "Start time too late."
     if startTime + duration > time.time():
         duration = time.time() - startTime
-    return generate_power(startTime, duration, detail)
-    
-    
+    return generate_power(startTime, duration, detail, test_instid)
+
+@result_api.route('/current/calculation/testid=<rowid>', methods=['GET', 'POST'])
+def calculate_current_per_min(rowid):
+    calc_db_pm(rowid)
+    return "OK"
+
+@result_api.route('/current/<detail>/<startTime>+<duration>', methods=['GET', 'POST'])
+def open_current_time(startTime, duration, detail):
+    return open_current(startTime, duration, detail)
+
+@result_api.route('/current/testid=<test_instid>/<detail>/<startTime>+<duration>', methods=['GET', 'POST'])
+def open_current_time_with_instid(startTime, duration, detail, test_instid):
+    return open_current(startTime, duration, detail, test_instid)
+
+
 @result_api.route('/current/<detail>/last/<duration>', methods=['GET', 'POST'])
 def open_current_last(duration, detail):
     duration = float(duration)
@@ -892,7 +1036,7 @@ def open_current_last(duration, detail):
 
 @result_api.route('/packet/device/<DevEui>/<startTime>+<duration>/<items>', methods=['GET', 'POST'])
 def open_packet_device(DevEui, startTime, duration, items):
-    response = {"DevEui": reverse_eui(DevEui).lower(),
+    response = {"DevEui": DevEui.lower(),
                 "StartTime": float(startTime),
                 "FinishTime": float(startTime) + float(duration), 
                 "UpdateTime": 0}
@@ -918,9 +1062,7 @@ def open_packet_last(count, items):
         pkt = dict(packet)
         if pkt["json"]:
             pkt["json"] = json.loads(pkt["json"])
-        if pkt["test"]:
-            pkt["test"] = json.loads(pkt["test"])
-        
+
         packets.append(pkt)
     
     html = plot_items(packets, items, None)

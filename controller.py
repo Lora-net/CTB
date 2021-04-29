@@ -1,10 +1,6 @@
-#file      controller.py
-
-#brief      general test control code
-
 #Revised BSD License
 
-#Copyright Semtech Corporation 2020. All rights reserved.
+#Copyright Semtech Corporation 2021. All rights reserved.
 
 #Redistribution and use in source and binary forms, with or without
 #modification, are permitted provided that the following conditions are met:
@@ -28,156 +24,316 @@
 #ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 #(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 #SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-# -*- coding: utf-8 -*-
-"""
-Created on Mon Oct 15 17:24:14 2018
 
-@author: flu
-"""
 import socket
 import json
 import threading
 import sqlite3
 import time
-import ext_sequence
 import logging
 from web_result import generate_cache
+import os, sys
+import pytest
+import multiprocessing
+from importlib import import_module
 
-from lib_base import DB_FILE_CONTROLLER, addr_tc, log_time, reliable_run, deduplication_threshold
-from lib_db import create_db_tables_tc, recover_db_tc
+from lib_base import FILE_PC_CONTEXT, addr_pc, log_time, reliable_run, config_logger,\
+    config_console, PROC_MSG, DB_FILE_BACKUP, POWER_TB_BACKUP_INTERVAL
+from lib_db import create_db_tables_tc, backup_db_pm
+
+sys.path.append("pytest_dir")
+
+PC_STATE = {
+    'IDLE': 0,
+    'WAIT_RSP': 1,
+    'RUNNING': 2
+}
 
 
-def sequence(pkt, conn):
-    if "error" in pkt["json"]:
-        return None
+def get_all_devices():
+    conn = sqlite3.connect(DB_FILE_BACKUP, timeout=60)
+    conn.row_factory = sqlite3.Row
+    response = conn.execute("SELECT * from device").fetchall()
+    conn.close()
+    devices = []
+    for device in response:
+        devices.append(dict(device))
+    return devices
 
-    dev_eui = pkt["json"]["DevEui"]
 
-    conn.execute(
-        "UPDATE schedule SET FinishTime=(?) WHERE StartTime is not null and \
-        FinishTime is null and Parameter <= CurrentPara and \
-        Criteria is 'count' and DevEui=(?)",
-        (time.time(), dev_eui))
-    conn.commit()
+def is_deveui_under_test(deveui, devices):
+    for device in devices:
+        if deveui == device['DevEui']:
+            return True
+    return False
 
-    conn.execute(
-        "UPDATE schedule SET FinishTime=(?) WHERE StartTime is not null and \
-        FinishTime is null and (StartTime + Parameter) <= (?) and \
-        Criteria is 'time' and DevEui=(?)",
-        (time.time(), time.time(), dev_eui))
-    conn.commit()
 
-    for response in conn.execute("SELECT rowid,* FROM schedule WHERE FinishTime > (?)", (time.time() - 5, )).fetchall():
-        response = dict(response)
-        threading.Thread(target=generate_cache, args = (response, )).start()
-
-    response = conn.execute(
-        'SELECT rowid, * from schedule WHERE devEUI=(?) AND FinishTime IS Null \
-        ORDER BY AddTime LIMIT 1', (dev_eui,)).fetchone()
-    conn.commit()
-    
-    # for debug purposes, due to a bug in the fw used to develop test bed
-    if pkt["json"]['MType'] in ["010", "100"]:
-        if pkt["json"]["FOpts"] == "03050307":
-            pkt["json"]["FOpts"] = "03070307"
-            pkt["size"] = -1
-            logging.debug("NA mote debug modified")
-
-    if not response:
-        logging.info("No test queued")
-        return pkt
-    else:
-        pkt["test"] = dict(response)
-        if pkt["test"]["Config"]:
-            pkt["test"]["Config"] = json.loads(pkt["test"]["Config"])
-
-        logging.info("Sequence information")
-        for line in json.dumps(pkt["test"], indent = 4).split("\n"):
-            logging.info(line)
-
-        if "FPending" in pkt["test"]["Config"] and pkt["test"]["Config"]["FPending"]:
-            if pkt["json"]['MType'] in ["010", "100"]:
-                pkt["json"]['MType'] = "100"
-                pkt["size"] = -1
-                
-            if pkt["json"]['MType'] in ["011", "101"]:
-                pkt["json"]['FPending'] = "1"
-                pkt["size"] = -1
-        
-        if not response['StartTime']:
-            if pkt["json"]['MType'] in ["010", "100", "000", "001"]:
-                conn.execute("UPDATE schedule SET StartTime=(?) WHERE rowid=(?)", (time.time(), pkt["test"]['rowid']))
-                conn.commit()
-            else:
-                return pkt
-        
-        # deduplication
-        if pkt["json"]['MType'] in ["010", "100", "000"] and response['UpdateTime']:
-            if time.time() - response['UpdateTime'] < deduplication_threshold:
-                logging.debug("dedup worked")
-                return None
-
-        if pkt["json"]['MType'] in ["010", "100"] and response['UpdateTime'] and "Ignore_interval" in pkt["test"]["Config"]:
-            if time.time() - response['UpdateTime'] < float(pkt["test"]["Config"]["Ignore_interval"]):
-                return None
-        
-        if pkt["json"]['MType'] in ["010", "100", "000"]:
-            conn.execute("UPDATE schedule SET UpdateTime=(?) WHERE rowid=(?)", (time.time(), pkt["test"]['rowid']))
-            conn.commit()
-
-        if pkt["json"]['MType'] in ["011", "101"] and "FPort" in pkt["test"]["Config"] and "FRMPayload" in pkt["test"]["Config"]:
-            pkt["json"]["FPort"] = pkt["test"]["Config"]["FPort"]
-            pkt["json"]["FRMPayload"] = pkt["test"]["Config"]["FRMPayload"]
-
+def process_pc_msg(byte_data, addr, pc):
+    logging.debug("received data are: {}".format(byte_data))
+    cmd = byte_data[0]
+    if cmd == PROC_MSG["WB_POST_SEQUENCE"]:
         try:
-            return eval("ext_sequence.sequence_" + response["Cat"] + "_" + response["SubCat"] + "(pkt, conn)")
-        except AttributeError:
-            logging.info("sequence_" + response["Cat"] + "_" + response["SubCat"], "not defined")
-            return pkt
+            schedules = json.loads(byte_data[1:].decode())
+            add_time = time.time()
+            devices = get_all_devices()
+            error_msg = ""
 
-    return pkt
+            for schedule in schedules:
+                logging.debug("schedule: {}".format(schedule))
+
+                for key in ['DevEui', 'Cat', 'SubCat', 'Criteria', 'Parameter']:
+                    if key not in schedule:
+                        error_msg += ", {} is not in the sequence {}".format(key, schedule)
+                if error_msg != "":
+                    continue
+
+                if not is_deveui_under_test(schedule['DevEui'].lower(), devices):
+                    error_msg += ", DevEui {} is not in the device list".format(schedule['DevEui'])
+                    continue
+
+                schedule["AddTime"] = add_time
+                if "Config" not in schedule:
+                    schedule["Config"] = {}
+                    schedule["Config"] = json.dumps(schedule["Config"])
+                pc.test_list.append(schedule)
+            pc.dump()
+            if error_msg != "":
+                error_msg = "Part of the sequence error" + error_msg
+                pc.sock.sendto(error_msg.encode("utf-8"), addr)
+            else:
+                pc.sock.sendto("ok".encode("utf-8"), addr)
+        except:
+            pc.sock.sendto("error".encode("utf-8"), addr)
+    elif cmd == PROC_MSG["WB_GET_SEQUENCE"]:
+        logging.debug("sending test_list")
+        pc.sock.sendto(json.dumps(pc.test_list).encode(), addr)
+    elif cmd == PROC_MSG["WB_DEL_SEQUENCE"]:
+        tmp = byte_data[1:].decode()
+        logging.debug("delete config, tmp is {}".format(tmp))
+        if tmp == "all":
+            if len(pc.test_list) > 0:
+                pc.test_list = []
+                if pc.state != PC_STATE['IDLE']:
+                    if pc.process:
+                        pc.process.terminate()
+                        logging.debug("sending termination")
+                        pc.process = None
+                    pc.set_state_wait()
+                pc.cancel_test_timeout_timer()
+                pc.dump()
+            pc.sock.sendto("ok".encode("utf-8"), addr)
+        else:
+            try:
+                rows_js = json.loads(tmp)
+                rows = [row['rowid'] for row in rows_js]
+                rows.sort(reverse=True)
+                for row in rows:
+                    if row < len(pc.test_list):
+                        pc.test_list.pop(row)
+                if 0 in rows and pc.state != PC_STATE['IDLE']:
+                    if pc.process:
+                        pc.process.terminate()
+                        pc.process = None
+                    pc.cancel_test_timeout_timer()
+                    pc.set_state_wait()
+                pc.dump()
+                pc.sock.sendto("ok".encode("utf-8"), addr)
+            except:
+                pc.sock.sendto("error".encode("utf-8"), addr)
+    elif cmd == PROC_MSG["WB_QUERY_TEST_STATE"]:
+        if not pc.test_list:
+            pc.sock.sendto("No test running".encode("utf-8"), addr)
+        else:
+            pc.sock.sendto("Test is running".encode("utf-8"), addr)
+    elif cmd == PROC_MSG["TC_SETUP_TEST"]:
+        schedule = json.loads(byte_data[1:].decode())
+        if pc.state == PC_STATE['WAIT_RSP']:
+            pc.test_list[0]["StartTime"] = schedule["StartTime"]
+        else:
+            pc.start_logger(schedule['Cat']+"_"+schedule['SubCat'])
+            logging.debug("Test started from pytest {}".format(schedule))
+            pc.test_list.insert(0, schedule)
+        pc.start_backup_pm_timer(schedule['TestInstID'])
+        pc.state = PC_STATE['RUNNING']
+        pc.dump()
+        logging.debug("[controller] setup test received, schedule is {}".format(schedule))
+    elif cmd == PROC_MSG["TC_TEARDOWN_TEST"]:
+        logging.debug("[controller] teardown test received")
+        schedule = json.loads(byte_data[1:].decode())
+        pc.cancel_test_timeout_timer()
+        if pc.state == PC_STATE['RUNNING']:
+            pc.state = PC_STATE['IDLE']
+            pc.test_list.pop(0)
+            pc.dump()
+            pc.process = None
+        elif pc.state == PC_STATE['WAIT_RSP']:
+            pc.state = PC_STATE['IDLE']
+        pc.backup_timer.cancel()
+        pc.backup_timer = None
+        backup_db_pm(schedule['TestInstID'])
+        pc.cache_thread = threading.Thread(target=generate_cache, args = (schedule, ))
+        pc.cache_thread.start()
+        if not pc.test_list:
+            pc.start_logger() # switch to default log
+
+
+class ControllerContext():
+    def __init__(self, sock, file):
+        self.sock = sock
+        self.file = file
+        self.process = None
+        self.test_list = []
+        self.state = PC_STATE['IDLE']
+        self.cache_thread = None
+        self.timer = None
+        self.backup_timer = None
+
+    def set_state_wait(self):
+        self.state = PC_STATE['WAIT_RSP']
+        self.wait_cnt = 0
+
+    def load(self):
+        if os.path.exists(self.file):
+            with open(self.file) as js:
+                data = json.load(js)
+                self.test_list = data["test_list"]
+                self.state = data["state"]
+        else:
+            pass # add loading from database
+
+    def dump(self):
+        with open(self.file, 'w') as js:
+            json.dump({"test_list": self.test_list, "state": self.state},
+                      js)
+
+    def start_logger(self, test_name=None):
+        logger = logging.getLogger()
+        if isinstance(logger.handlers[-1], logging.handlers.RotatingFileHandler):
+            logger.removeHandler(logger.handlers[-1])
+            if test_name:
+                timestamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+                file = os.path.join("log", "test_{}_{}.log".format(test_name, timestamp))
+                config_logger(file)
+            else:
+                config_logger()
+
+    def start_backup_pm_timer(self, test_inst_id):
+        if self.backup_timer:
+            self.backup_timer.cancel()
+        self.backup_timer = threading.Timer(POWER_TB_BACKUP_INTERVAL,
+                                            self.backup_handler, args=(test_inst_id,))
+        self.backup_timer.start()
+
+    def start_test_timeout_timer(self, test):
+        test_name = test['Cat']+"_"+test['SubCat']
+        if "timeout" in test and "whole_test" in test['timeout']:
+            timeout = test['timeout']['whole_test']
+        else:
+            try:
+                test = import_module("test_{}".format(test['Cat']))
+                timeout = eval("test.test_"+test_name+"_timeout")
+                logging.debug("test timeout is %d" % timeout)
+            except:
+                logging.info("No whole test timeout is configured")
+                return
+        logging.debug("test level time out is {}".format(timeout))
+        self.timer = threading.Timer(timeout, self.timeout_handler)
+        self.timer.start()
+
+    def cancel_test_timeout_timer(self):
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+
+    def timeout_handler(self):
+        logging.warning("test timeout is triggered")
+        if self.process:
+            logging.debug("terminating process")
+            self.process.terminate()
+            self.process = None
+            self.test_list.pop(0)
+            self.set_state_wait()
+            self.dump()
+            self.timer = None
+
+    def backup_handler(self, test_inst_id):
+        self.backup_timer = threading.Timer(POWER_TB_BACKUP_INTERVAL,
+                                            self.backup_handler, args=(test_inst_id,))
+        self.backup_timer.start()
+        backup_db_pm(test_inst_id)
 
 
 def run_controller():
     create_db_tables_tc()
-    recover_db_tc()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(1)
-    sock.bind(("", addr_tc[1]))
-    
-    logging.info("controller successful start")
-    
-    addr_proxy = ()
+    sock.bind(("", addr_pc[1]))
 
-    conn = sqlite3.connect(DB_FILE_CONTROLLER, timeout=60)
-    conn.row_factory = sqlite3.Row
+    pc = ControllerContext(sock, FILE_PC_CONTEXT)
+    pc.load()
+    logging.info("controller successfully started.")
 
     while True:
         try:
             byte_data, addr = sock.recvfrom(10240)
+            process_pc_msg(byte_data, addr, pc)
         except socket.timeout:
-            continue
-        addr_proxy = addr
+            pass
 
-        json_data = json.loads(byte_data[4:].decode())
+        if pc.state == PC_STATE['IDLE'] and len(pc.test_list) > 0:
+            if pc.cache_thread and pc.cache_thread.is_alive():
+                logging.warning("cache_thread is still alive")
+                continue
 
-        if "rxpk" in json_data:
-            pkt = json_data["rxpk"]
-            pkt = sequence(pkt, conn)
+            test = pc.test_list[0]
+            test_cmd = []
+            test_cmd.append("-s")
+            if "pcap" in test and test['pcap'] == 1:
+                test_cmd.append("--pcap")
+            if "verify_only" in test and test['verify_only'] == 1:
+                test_cmd.append("--verify_only")
+                if "rowid" in test:
+                    test_cmd.append("--rowid={}".format(test["rowid"]))
+            test_cmd.append("--deveui={}".format(test["DevEui"]))
+            test_cmd.append("--addtime={}".format(test["AddTime"]))
+            test_cmd.append("--criteria={}".format(test["Criteria"]))
+            test_cmd.append("--parameter={}".format(test["Parameter"]))
+            test_cmd.append("--config={}".format(test["Config"]))
+            test_cmd.append("test_{}.py::test_{}_{}".format(test["Cat"], test["Cat"], test["SubCat"]))
+            pc.start_logger(test["Cat"]+"_"+test["SubCat"])
 
-            byte_data = byte_data[:4] + json.dumps({"rxpk": pkt}).encode()
-            sock.sendto(byte_data, addr_proxy)
-            continue
-        if "txpk" in json_data:
-            pkt = json_data["txpk"]
-            pkt = sequence(pkt, conn)
-            
-            byte_data = byte_data[:4] + json.dumps({"txpk": pkt}).encode()
-            sock.sendto(byte_data, addr_proxy)
-            continue
+            logging.info("Pytest controller starts test: {}".format(test_cmd))
+            os.chdir("pytest_dir")
+            pc.process = multiprocessing.Process(target=pytest.main, args=(test_cmd,))
+            pc.process.start()
+            os.chdir("..")
+
+            time.sleep(2)
+            if not pc.process.is_alive():
+                logging.error("Cannot start test_{}_{} properly!".format(test["Cat"], test["SubCat"]))
+                pc.test_list.pop(0)
+            else:
+                logging.debug("test started properly, process is {}".format(pc.process.pid))
+                pc.set_state_wait()
+                pc.start_test_timeout_timer(test)
+                pc.dump()
+        elif pc.state == PC_STATE['WAIT_RSP']:
+            pc.wait_cnt += 1
+            if pc.wait_cnt > 10:
+                if pc.process:
+                    pc.process.terminate()
+                    pc.process = None
+                    pc.test_list.pop(0)
+                    pc.wait_cnt = 0
+                else:
+                    pc.state = PC_STATE['IDLE']
+                    pc.dump()
+                pc.cancel_test_timeout_timer()
 
 
 if __name__ == "__main__":
+    config_console()
+    if os.path.exists(FILE_PC_CONTEXT):
+        os.remove(FILE_PC_CONTEXT)
     reliable_run(run_controller, loop = True)
-

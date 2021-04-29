@@ -1,0 +1,48 @@
+{% macro test_table(cat,subcat,testRows, active = false) %}
+    {% for t in testRows %}
+        {% if cat == t['Cat'] and subcat == t['SubCat'] %}
+            {% if active == false %}
+                <div class="col-md-12">
+                <table class="table">
+                <thead>
+                <tr>
+                    <th>DevEUI</th>
+                    <th>BenchID</th>
+                    <th>FinishTime</th>
+                    <th>Result</th>
+                    <th>Comments</th>
+                    <th>Operator</th>
+                    <th>Details</th>
+                </tr>
+                </thead>
+                <tbody>
+            {% endif %}
+
+        <tr>
+            <td>{{ t['DevEUI'] }}</td>
+            <td>{{ t['BenchID'] }}</td>
+            <td>{{ t['FinishTime']|cTime }}</td>
+            {% if t['Passed']==1 %}
+                <td><span style='color: #008000;'>Passed</span></td>
+            {% elif t['Passed']==-3 %}
+                <td><span style='color: #00FF00;'>Observation</span></td>
+            {% else %}
+                <td><span style='color: #FF0000;'>Failed</span></td>
+            {% endif %}
+            <td>{{ t['Comments'] }}</td>
+            <td>{{ t['Operator'] }}</td>
+            <td style='padding: 5px 10px 5px 5px;' align='center'>
+                <a href='/result/testid={{ t['TestInstID'] }}'>{{ t['TestInstID'] }}</a></td>
+        </tr>
+
+        {% if active == false %}
+            </tbody>
+            </table>
+            </div>
+        {% endif %}
+
+            {% set active = true %}
+
+        {% endif %}
+    {% endfor %}
+{%- endmacro %}

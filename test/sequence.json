@@ -1,0 +1,4 @@
+[
+{"DevEui":"70b3b514900b03a8", "Cat":"join", "SubCat":"deny","Criteria":"count", "Parameter":4 },
+{"DevEui":"70b3b514900b03a8", "Cat":"join", "SubCat":"mic","Criteria":"count", "Parameter":4 }
+]

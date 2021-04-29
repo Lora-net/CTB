@@ -1,6 +1,10 @@
 # LoRaWAN conformance testbed
 
-The peoject for LoRaWAN conformance testbed
+The project for LoRaWAN conformance testbed
+
+v1.0.0 released on April 30, 2020
+
+v1.1.0 released on April 29, 2021. Read release notes for changes information.
 
 ## Objective
 

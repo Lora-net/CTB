@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <link href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.datatables.net/1.10.21/css/dataTables.bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.datatables.net/select/1.3.1/css/select.bootstrap.min.css" rel="stylesheet">
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h3 class="text-center text-muted">Report Generator Selection</h3>
+      </div>
+      <div class="row">
+        <div class="form-group col-xs-4">
+          <label for="all_vendors">Select a vendor</label>
+          <select class="form-control" id="all_vendors">
+            {% for o in all_vendors %}
+                    <option value="{{ o }}">{{ o }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group col-xs-4">
+          <label for="all_products">Select a product</label>
+          <select class="form-control" id="all_products">
+            {% for o in all_products %}
+                    <option value="{{ o }}">{{ o }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group col-xs-4">
+          <label for="all_skus">Select a region</label>
+          <select class="form-control" id="all_skus">
+            {% for o in all_skus %}
+                    <option value="{{ o }}">{{ o }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div><br>
+
+      <div>
+        <button type="button" id="process_input">Show available results!</button>
+      </div><br><br>
+
+      <div><table id='datatable' class = 'table table-striped table-bordered' style = 'margin-left: auto; margin-right: auto; width: 90%;'>
+         <thead>
+            <tr>
+              <th>TestInstID</th>
+              <th>DevEui</th>
+              <th>BenchID</th>
+              <th>Cat</th>
+              <th>SubCat</th>
+              <th>CurrentPara</th>
+              <th>StartTime</th>
+              <th>FinishTime</th>
+              <th>Passed</th>
+              <th>ErrorMsg</th>
+              <th>Comments</th>
+              <th>Operator</th>
+              <th>Ready</th>
+            </tr>
+         </thead>
+         <tbody>
+
+         </tbody>
+         <tfoot>
+            <tr>
+              <th>TestInstID</th>
+              <th>DevEui</th>
+              <th>BenchID</th>
+              <th>Cat</th>
+              <th>SubCat</th>
+              <th>CurrentPara</th>
+              <th>StartTime</th>
+              <th>FinishTime</th>
+              <th>Passed</th>
+              <th>ErrorMsg</th>
+              <th>Comments</th>
+              <th>Operator</th>
+              <th>Ready</th>
+            </tr>
+         </tfoot>
+      </table></div>
+    </div>
+
+      <script src="https://code.jquery.com/jquery-1.12.4.js" type="text/javascript"></script>
+      <script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/js/bootstrap.min.js"></script>
+      <script src="https://cdn.datatables.net/1.10.21/js/jquery.dataTables.min.js"></script>
+      <script src="https://cdn.datatables.net/1.10.21/js/dataTables.bootstrap.min.js"></script>
+      <script src="https://cdn.datatables.net/select/1.3.1/js/dataTables.select.min.js"></script>
+      <script src="https://cdn.datatables.net/buttons/1.6.2/js/dataTables.buttons.min.js"></script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.8.4/moment.min.js"></script>
+      <script src="https://cdn.datatables.net/plug-ins/1.10.21/sorting/datetime-moment.js"></script>
+      <script type="text/javascript">
+        $(document).ready(function() {
+
+          var table = $('#datatable').DataTable( {
+              dom: 'Bfrtip',
+              ajax: {
+                  dataSrc: "",
+                  url: "/_process_data",
+                  data: function(d){
+                      d.selected_vendor = $('#all_vendors').val(),
+                      d.selected_product = $('#all_products').val(),
+                      d.selected_sku = $('#all_skus').val()
+                  }
+              },
+              columns: [
+                  {data: "TestInstID", render: function (value) {
+                      return "<a href='/result/testid="+value+"'>"+value+"</a>"}},
+                  {data: "DevEui"},
+                  {data: "BenchID"},
+                  {data: "Cat"},
+                  {data: "SubCat"},
+                  {data: "CurrentPara"},
+                  {data: "StartTime", render: function (value) { return moment(value, 'X').format("YYYY-MM-DD HH:mm:ss.S")}},
+                  {data: "FinishTime", render: function (value) { return moment(value, 'X').format("YYYY-MM-DD HH:mm:ss.S")}},
+                  {data: "Passed", render: function (value) {
+                    var passed = [];
+                    switch (value) {
+                      case 0:
+                        passed = "<span style='color: #000000;'>Running</span>";
+                        break;
+                      case 1:
+                        passed = "<span style='color: #008000;'>Passed</span>";
+                        break;
+                      case -1:
+                        passed = "<span style='color: #FF0000;'>Failed</span>";
+                        break;
+                      case -2:
+                        passed = "<span style='color: #FFA500;'>Aborted</span>";
+						break;
+                      case -3:
+                        passed = "<span style='color: #00FF00;'>Observation</span>";
+						break;
+                      case -4:
+                        passed = "<span style='color: #000000;'>N/A</span>";
+						break;
+                    }
+                    return passed;
+                    }},
+                  {data: "ErrorMsg"},
+                  {data: "Comments"},
+                  {data: "Operator"},
+                  {data: "Ready", render: function (value) {
+                    var passed = [];
+                    switch (value) {
+                      case 0:
+                        passed = "<span style='color: #000000;'>None</span>";
+                        break;
+                      case 2:
+                        passed = "<span style='color: #008000;'>Ready</span>";
+                        break;
+                      case 1:
+                        passed = "<span style='color: #FFA500;'>Generating</span>";
+                    }
+                    return passed;
+                    }}
+                  ],
+              select: true,
+              searching: false,
+              paging: false,
+              buttons: [
+                  {
+                      text: 'Generate Report from Selected Rows',
+                      action: function (e, dt, button, config) {
+                          var testsSelected = dt.rows({selected: true}).data();
+                          var numTests = dt.rows({selected: true}).count();
+                          var testInstList = [];
+                          for (var i=0; i<numTests; i++) {
+                              testInstList[i] = testsSelected[i]["TestInstID"];
+                          }
+
+                          var arrStr = encodeURIComponent(JSON.stringify(testInstList));
+                          var v = $('#all_vendors').val();
+                          var p = $('#all_products').val();
+                          var s = $('#all_skus').val();
+
+                          window.location.href = '/_generate_report?selected_vendor=' + v+ '&selected_product=' + p + '&selected_sku=' + s + '&test_list=' + arrStr;
+                          {#$.ajax({#}
+                          {#    url: '/_generate_report',#}
+                          {#    type: 'get',#}
+                          {#    contentType: 'application/json; charset=utf-8',#}
+                          {#    data: {#}
+                          {#        selected_vendor: $('#all_vendors').val(),#}
+                          {#        selected_product: $('#all_products').val(),#}
+                          {#        selected_sku: $('#all_skus').val(),#}
+                          {#        test_list: arrStr#}
+                          {#    }#}
+                          {#    success:function(response){ document.write(response);#}
+
+                      },
+                  },
+              ]
+
+          } );
+
+        $('#all_vendors').change(function(){
+
+          $.getJSON('/_update_dropdown', {
+            selected_vendor: $('#all_vendors').val()
+
+          }).success(function(data) {
+                $('#all_products').html(data.html_string_selected);
+           })
+        });
+/*  Don't need to call update for products dropdown since SKUs are static for now
+        $('#all_products').change(function(){
+
+          $.getJSON('/_update_dropdown', {
+            selected_product: $('#all_products').val()
+
+          }).success(function(data) {
+                $('#all_skus').html(data.html_string_selected);
+           })
+        });
+*/
+        $('#process_input').bind('click', function() {
+            table.ajax.url("/_process_data").load();
+            return false;
+        });
+
+      });
+    </script>
+  </body>
+</html>

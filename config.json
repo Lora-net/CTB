@@ -1,10 +1,15 @@
 {
   "backup_interval": 3600, 
+  "num_log_files" : 128,
   "use_internal_gateway": 1, 
   "network_address": {
     "test_controller": {
       "ip": "localhost",
-      "port": 1691
+      "port": 1700
+    },
+    "pytest_controller": {
+      "ip": "localhost",
+      "port": 1701
     },
     "packet_forwarder": {
       "ip": "",
@@ -19,17 +24,20 @@
       "port": 1692
     }
   },
-  "gateway_id": "353530321C005000", 
+  "gateway_id": "353530321C005000",
+  "gateway_max_power": 20,
   "folder": {
     "cache": "cache",
     "backup": "db",
-    "power": "tmp\/power"
+    "power": "tmp\/power",
+    "pcap": "pcap"
   },
   "file": {
     "database_proxy": "tmp\/db_proxy.db",
     "database_controller": "tmp\/db_tc.db",
     "database_backup": "db\/db_backup.db",
-    "database_power": "db\/db_pm.db"
+    "database_power": "db\/db_pm.db",
+    "pc_context": "tmp\/pc_context.json"
   }, 
   "deduplication_threshold": 0.1
 }

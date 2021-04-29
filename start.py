@@ -4,7 +4,7 @@
 
 #Revised BSD License
 
-#Copyright Semtech Corporation 2020. All rights reserved.
+#Copyright Semtech Corporation 2021. All rights reserved.
 
 #Redistribution and use in source and binary forms, with or without
 #modification, are permitted provided that the following conditions are met:
@@ -29,91 +29,106 @@
 #(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 #SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import threading
+import threading, subprocess
 import time
-import os
+import os, sys
 import lib_db
 import logging
-from logging.handlers import RotatingFileHandler
 
 
 from proxy import run_proxy
 from controller import run_controller
 from web_main import run_web
-from lib_base import POWER_FOLDER, DB_FOLDER, CACHE_FOLDER, DB_BACKUP_INTERVAL, reliable_run, use_internal_gateway, report_ip
+from lib_base import POWER_FOLDER, DB_FOLDER, CACHE_FOLDER, PCAP_FOLDER, DB_BACKUP_INTERVAL,\
+    FILE_PC_CONTEXT, reliable_run, use_internal_gateway, report_ip, config_console, config_logger,\
+    config, gw_mac, NUM_LOG_FILES
 
+import json
+
+LOG_DIR = os.path.join(os.getcwd(), "log")
 
 def run_backup():
-    lib_db.backup_db_pm()
     lib_db.backup_db_proxy()
     lib_db.backup_db_tc()
 
 
 def restart_dead_thread(t):
-    label = {0: "ADC driver     ", 
-             1: "web host       ", 
-             2: "test controller", 
-             3: "proxy          "}
+    label = {0: "web host       ",
+             1: "test controller",
+             2: "proxy          "}
     
-    for _ in range(1, 4):
-        alive = t[_].is_alive()
-        logging.debug(label[_] + " %d" % alive)
+    for _, thread in enumerate(t):
+        alive = thread.is_alive()
+        try:
+            thread_label = label[_]
+        except KeyError:
+            thread_label = "???            "
+        logging.log(logging.NOTSET, thread_label + " %d" % alive)
         if not alive:
-            t[_].run()
-            logging.error(label[_] + " restarted")
+            thread.run()
+            logging.error(thread_label + " restarted") # should this be checked again?
 
             with open("error.log", "a") as f:
-                f.write(_ + " restarted\n")
+                f.write(_ + " restarted\n") # uses a counter (_), maybe replace with thread_label
 
+# Limit files in log directory
+def dir_file_limiter(log_path, max_files):
+    logging.debug("Running file limiter on " + log_path)
 
-def config_logger():
-    if not os.path.exists("log"):
-        os.mkdir("log")
-
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-
-    fh = RotatingFileHandler(os.path.join("log", "ctb.log"), maxBytes=100000, backupCount=128)
-    fh.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
+    # sort list of files. move to log directory to make easier
+    cur_dir = os.getcwd()
+    os.chdir(log_path)
+    files_sorted = sorted(os.listdir(log_path), key = os.path.getmtime)
+    
+    # remove oldest files to meet criteria
+    for i in range(0, len(files_sorted) - max_files):
+        logging.debug("Removing file " + files_sorted[i])
+        os.remove(files_sorted[i])
+    
+    os.chdir(cur_dir)
 
 if __name__== "__main__":
+    config_console()
     config_logger()
 
     report_ip()
 
-    for folder in [POWER_FOLDER, DB_FOLDER, CACHE_FOLDER]:
+    if use_internal_gateway:
+        result = subprocess.run(['/home/pi/lora-net/picoGW_hal/util_chip_id/util_chip_id',
+                                 '-d', '/dev/ttyACM0'], stdout=subprocess.PIPE)
+        config["gateway_id"] = result.stdout.decode('utf-8').strip()
+        if "ERROR" in config["gateway_id"]:
+            logging.error("getting gw_mac error, %s" % config["gateway_id"])
+            sys.exit(1)
+        else:
+            logging.info("gateway id is " + config["gateway_id"])
+            gw_mac = bytes.fromhex(config["gateway_id"])
+
+    for folder in [POWER_FOLDER, DB_FOLDER, CACHE_FOLDER, PCAP_FOLDER]:
         if not os.path.exists(folder):
             os.mkdir(folder)
+    if os.path.exists(FILE_PC_CONTEXT):
+        os.remove(FILE_PC_CONTEXT)
 
+    lib_db.create_db_tables_backup()
     lib_db.create_db_tables_proxy()
     lib_db.create_db_tables_tc()
-    lib_db.create_db_tables_pm()
 
     t = []
-    t.append(threading.Thread(target=os.system, args=("cd ads1256 && sudo ./ads1256_driver",)))
     t.append(threading.Thread(target=reliable_run, args=(run_web, True)))
     t.append(threading.Thread(target=reliable_run, args=(run_controller, True)))
     t.append(threading.Thread(target=reliable_run, args=(run_proxy, True)))
-
-    if use_internal_gateway:
-        t.append(threading.Thread(target=os.system, args=("cd /home/pi/lora-net/picoGW_packet_forwarder/lora_pkt_fwd/ "
-                                                          "&& ./lora_pkt_fwd",)))
-
-    time.sleep(10)
 
     for th in t:
         th.start()
         time.sleep(0.1)
 
     time.sleep(5)
-    
+
     while True:
         reliable_run(run_backup, loop = False)
-        
+        dir_file_limiter(LOG_DIR, NUM_LOG_FILES)
+
         for _ in range(int(DB_BACKUP_INTERVAL/10)):
             report_ip()
             restart_dead_thread(t)

@@ -4,7 +4,7 @@
 
 #Revised BSD License
 
-#Copyright Semtech Corporation 2020. All rights reserved.
+#Copyright Semtech Corporation 2021. All rights reserved.
 
 #Redistribution and use in source and binary forms, with or without
 #modification, are permitted provided that the following conditions are met:
@@ -42,12 +42,99 @@ import sqlite3
 import random
 import logging
 
-import lib_packet
-from lib_base import addr_ns, addr_tc, gw_mac, DB_FILE_PROXY, addr_pf, reliable_run, deduplication_threshold
-from lib_packet import get_toa
+from lib_base import addr_ns, addr_tc, gw_mac, DB_FILE_PROXY, DB_FILE_BACKUP, addr_pf, reliable_run,\
+    deduplication_threshold, MAX_TX_POWER, PROC_MSG, reverse_eui
+from lib_packet import get_toa, Codec
 from lib_db import recover_db_proxy, create_db_tables_proxy
 
 buffer = {}
+
+
+def append_packet(pkt, packets, test_inst_id, conn):
+    packets.append(pkt)
+    if pkt["stat"] == 0 and pkt["direction"] == "up":
+        logging.debug("[proxy] uplink before tc")
+        conn.execute("INSERT INTO packet (TestInstID, tmst, chan, rfch, freq, stat, modu, datr, "
+                     "codr, lsnr, rssi, size, data, time, direction, json, toa) "
+                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (test_inst_id, pkt['tmst'], pkt['chan'], pkt['rfch'], pkt['freq'], pkt["stat"], pkt['modu'], pkt['datr'],
+                      pkt['codr'], pkt['lsnr'], pkt['rssi'], pkt['size'], pkt['data'], pkt["time"], pkt["direction"],
+                      json.dumps(pkt["json"]), get_toa(pkt['size'], pkt['datr'])))
+    elif pkt["stat"] == 0 and pkt["direction"] == "down":
+        logging.debug("[proxy] downlink before tc")
+        conn.execute("INSERT INTO packet "
+                     "(TestInstID, tmst, rfch, freq, stat, modu, datr, codr, size, data, "
+                     "time, powe, direction, fdev, prea, json, toa) "
+                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (test_inst_id, pkt['tmst'], pkt['rfch'], pkt['freq'], pkt["stat"], pkt['modu'], pkt['datr'],
+                      pkt['codr'], pkt['size'], pkt['data'], pkt["time"], pkt['powe'], pkt["direction"], pkt['fdev'],
+                      pkt['prea'], json.dumps(pkt["json"]), get_toa(pkt['size'], pkt['datr'])))
+    elif pkt["stat"] == 1 and pkt["direction"] == "up":
+        logging.debug("[proxy] uplink after tc")
+        conn.execute("INSERT INTO packet (TestInstID, tmst, chan, rfch, freq, stat, modu, datr, "
+                     "codr, lsnr, rssi, size, data, time, direction, json, toa) "
+                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (test_inst_id, pkt['tmst'], pkt['chan'], pkt['rfch'], pkt['freq'], pkt["stat"], pkt['modu'], pkt['datr'],
+                      pkt['codr'], pkt['lsnr'], pkt['rssi'], pkt['size'], pkt['data'], pkt["time"], pkt["direction"],
+                      json.dumps(pkt["json"]), get_toa(pkt['size'], pkt['datr'])))
+    elif pkt["stat"] == 1 and pkt["direction"] == "down":
+        logging.debug("[proxy] downlink after tc")
+        conn.execute("INSERT INTO packet "
+                     "(TestInstID, tmst, rfch, freq, stat, modu, datr, codr, size, data, "
+                     "time, powe, direction, fdev, prea, json, toa) "
+                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (test_inst_id, pkt['tmst'], pkt['rfch'], pkt['freq'], pkt["stat"], pkt['modu'], pkt['datr'],
+                      pkt['codr'], pkt['size'], pkt['data'], pkt["time"], pkt['powe'], pkt["direction"], pkt['fdev'],
+                      pkt['prea'], json.dumps(pkt["json"]),
+                      get_toa(pkt['size'], pkt['datr'])))
+    conn.commit()
+
+
+def append_delay(token, time, dst, delays):
+    delay = {}
+    delay["token"] = "%02x%02x" % (token[0], token[1])
+    delay["time_gen"] = time
+    delay["dst"] = dst
+    logging.debug("[proxy] append delay: {}".format(delay))
+    delays.append(delay)
+
+
+def update_delay(token, dst, delays, test_inst_id, conn):
+    token_tmp = "%02x%02x" % (token[0], token[1])
+    for delay in delays[::-1]:
+        if delay["token"] == token_tmp and delay["dst"] == dst:
+            logging.debug("[proxy] update delay: {}".format(delay))
+            if "time_ack" not in delay:
+                delay["time_ack"] = time.time()
+                conn.execute("INSERT INTO delay (TestInstID, token, time_gen, dst, time_ack) VALUES (?, ?, ?, ?, ?)",
+                         (test_inst_id, delay["token"], delay["time_gen"], delay["dst"],
+                          delay["time_ack"]))
+                conn.commit()
+            else:
+                logging.warning("Ack has already been received. Remove duplicate")
+            break
+
+
+def get_device(deveui):
+    conn = sqlite3.connect(DB_FILE_BACKUP, timeout=60)
+    conn.row_factory = sqlite3.Row
+    device = conn.execute("SELECT * from device WHERE devEUI = (?)", (deveui,)).fetchone()
+    if device:
+        device = dict(device)
+        device['DevEui'] = reverse_eui(device['DevEui'])
+        response = conn.execute("SELECT Region from regionSKU WHERE SkuID = (?)", (device['SkuID'],)).fetchone()
+        if response:
+            region = dict(response)
+            logging.debug("region is {}".format(region))
+            device['region'] = region['Region']
+        else:
+            device = None
+            logging.error("Cannot find region information for device: {}".format(deveui))
+    else:
+        logging.error("Cannot find information for device: {}".format(deveui))
+    conn.close()
+    return device
+
 
 def run_proxy():
     create_db_tables_proxy()
@@ -66,7 +153,13 @@ def run_proxy():
     conn = sqlite3.connect(DB_FILE_PROXY, timeout=60)
     conn.row_factory = sqlite3.Row
 
+    packets = []
+    delays = []
+    is_test_running = False
+    test_inst_id = 0
+    logging.debug("proxy successfully started")
     t = 0
+    codec = Codec(conn, test_inst_id)
 
     while True:
 
@@ -74,29 +167,27 @@ def run_proxy():
         for pl in buffer:
             pkt = buffer[pl]["pkt"]
             if time.time() - buffer[pl]["time"] > deduplication_threshold:
-                pkt["json"] = lib_packet.decode_uplink(pkt, conn)
+                to_be_removed.append(pl)
 
+                pkt["json"] = codec.decode_uplink(pkt)
                 logging.info("Received from GW")
                 for line in json.dumps(pkt, indent=4, sort_keys=True).split("\n"):
                     logging.info(line)
 
+                if "error" in pkt["json"]:
+                    continue
+
+                pkt["time"] = time.time()
+                pkt["direction"] = "up"
                 byte_data = bytes([2, random.randint(0, 255), random.randint(0, 255), 6]) + \
                             json.dumps({"rxpk": pkt}).encode()
-                sock.sendto(byte_data, addr_tc)                
+                sock.sendto(byte_data, addr_tc)
 
-                conn.execute("INSERT INTO packet (tmst, chan, rfch, freq, stat, modu, datr, \
-                             codr, lsnr, rssi, size, data, time, direction, json, toa) \
-                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                             (pkt['tmst'], pkt['chan'], pkt['rfch'], pkt['freq'], 0, pkt['modu'], pkt['datr'],
-                              pkt['codr'], pkt['lsnr'], pkt['rssi'], pkt['size'], pkt['data'], time.time(), 'up',
-                              json.dumps(pkt["json"]), get_toa(pkt['size'], pkt['datr'])))
-
+                pkt["stat"] = 0
                 token = list(byte_data[1:3])
-                conn.execute("INSERT INTO delay (token, time_gen, dst) VALUES (?, ?, ?)",
-                             ("%02x%02x" % (token[0], token[1]), time.time(), "tc"))
-                conn.commit()
-
-                to_be_removed.append(pl)
+                if is_test_running:
+                    append_packet(pkt, packets, test_inst_id, conn)
+                    append_delay(token, buffer[pl]["time"], "tc", delays)
 
         for pl in to_be_removed:
             del buffer[pl]
@@ -108,15 +199,40 @@ def run_proxy():
         except ConnectionResetError:
             logging.error("ConnectionResetError, check test controller")
             continue
-        
-        if list(byte_data)[3] in [6]:
-            logging.debug(str(list(byte_data)[3]) + " controller -> proxy")
-        if list(byte_data)[3] in [0, 2, 5]:
-            logging.debug(str(list(byte_data)[3]) + " Packetforwarder -> proxy")
-        if list(byte_data)[3] in [1, 3, 4]:
-            logging.debug(str(list(byte_data)[3]) + " NS -> proxy")
-        
-        if list(byte_data)[3] == 0:  # PUSH_DATA from the gateway, uplink packets
+
+        time_of_arrival = time.time()
+        msg_type = list(byte_data)[3]
+        logging.debug("received data: {}, msg_type:{}".format(list(byte_data)[0:5],
+                                                              msg_type))
+        if msg_type in [PROC_MSG["TC_DATA"]]:
+            logging.info(str(msg_type) + " controller -> proxy")
+        elif msg_type in [PROC_MSG["GW_PUSH_DATA"], PROC_MSG["GW_PULL_DATA"], PROC_MSG["GW_TX_ACK"]]:
+            logging.debug(str(msg_type) + " Packetforwarder -> proxy")
+        elif msg_type in [PROC_MSG["NS_PUSH_ACK"], PROC_MSG["NS_PULL_RSP"], PROC_MSG["NS_PULL_ACK"]]:
+            logging.debug(str(msg_type) + " NS -> proxy")
+        elif msg_type == PROC_MSG["TC_SETUP_TEST"]:
+            is_test_running = True
+            test_instance = json.loads(byte_data[4:].decode())
+            device = get_device(test_instance["DevEui"])
+            test_inst_id = test_instance["TestInstID"]
+            logging.debug("start new test, device is: {}".format(device))
+            codec = Codec(conn, test_inst_id, device)
+            packets = []
+            delays = []
+            continue
+        elif msg_type == PROC_MSG["TC_GET_PACKET"]:
+            byte_data = json.dumps(packets).encode()
+            logging.debug("[proxy] packets length is:{}, dst addr is:{}".format(len(byte_data), addr))
+            sock.sendto(byte_data, addr)
+            continue
+        elif msg_type == PROC_MSG["TC_TEARDOWN_TEST"]:
+            logging.debug("[proxy] sent stop response")
+            is_test_running = False
+            packets = []
+            delays = []
+            continue
+
+        if msg_type == 0:  # PUSH_DATA from the gateway, uplink packets
             original_token = byte_data[1:3]
 
             addr_push = addr
@@ -125,9 +241,10 @@ def run_proxy():
             json_data = json.loads(byte_data[12:].decode())
 
             if 'rxpk' in json_data:
+                logging.info("rx packet received from gateway at {}".format(time.time()))
                 for pkt in json_data['rxpk']:
                     if pkt["data"] not in buffer:
-                        buffer[pkt["data"]] = {"pkt": pkt, "time": time.time()}
+                        buffer[pkt["data"]] = {"pkt": pkt, "time": time_of_arrival}
                     else:
                         logging.info("duplicate packet received. ")
                         if int(pkt["rssi"]) > int(buffer[pkt["data"]]["pkt"]["rssi"]):
@@ -137,37 +254,30 @@ def run_proxy():
                 sock.sendto(byte_data, addr_ns)
 
                 token = list(original_token)
-                conn.execute("INSERT INTO delay (token, time_gen, dst) VALUES (?, ?, ?)",
-                             ("%02x%02x" % (token[0], token[1]), time.time(), "ns"))
-                conn.commit()
+                if is_test_running:
+                    append_delay(token, time.time(), "ns", delays)
 
             byte_data = bytes([2]) + original_token + bytes([1])
             sock.sendto(byte_data, addr_push)
 
             continue
 
-        if list(byte_data)[3] == 1:  # PUSH_ACT from the ns
-
-            token = list(byte_data[1:3])
-            conn.execute("UPDATE delay SET time_ack = (?) where rowid = \
-                         (SELECT rowid FROM delay WHERE token = (?) AND dst = (?) ORDER BY time_gen DESC LIMIT 1)",
-                         (time.time(), "%02x%02x" % (token[0], token[1]), "ns"))
-            conn.commit()
+        if msg_type == 1:  # PUSH_ACK from the ns
+            if is_test_running:
+                update_delay(token, "ns", delays, test_inst_id, conn)
 
             continue
 
-        if list(byte_data)[3] == 2:  # PULL_DATA from the gateway
+        if msg_type == 2:  # PULL_DATA from the gateway
             gw_mac_tmp = byte_data[4:12]
             addr_pull = addr
-            
+
             byte_data = byte_data[0:4] + gw_mac + byte_data[12:]
-            
+
             sock.sendto(byte_data, addr_ns)
             token = list(byte_data[1:3])
-
-            conn.execute("INSERT INTO delay (token, time_gen, dst) VALUES (?, ?, ?)",
-                         ("%02x%02x" % (token[0], token[1]), time.time(), "ns"))
-            conn.commit()
+            if is_test_running:
+                append_delay(token, time.time(), "ns", delays)
 
             byte_data = list(byte_data[:4])
             byte_data[3] = 4
@@ -178,54 +288,43 @@ def run_proxy():
 
             continue
 
-        if list(byte_data)[3] == 4: # PULL_ACK from the ns
-            token = list(byte_data[1:3])
-            conn.execute("UPDATE delay SET time_ack = (?) where rowid = \
-                         (SELECT rowid FROM delay WHERE token = (?) AND dst = (?) ORDER BY time_gen DESC LIMIT 1)",
-                         (time.time(), "%02x%02x" % (token[0], token[1]), "ns"))
-            conn.commit()
-
+        if msg_type == 4: # PULL_ACK from the ns
+            if is_test_running:
+                update_delay(token, "ns", delays, test_inst_id, conn)
             continue
 
-        if list(byte_data)[3] == 3:  # PULL_RSP from the ns, downlink packets
+        if msg_type == 3:  # PULL_RSP from the ns, downlink packets
             original_token = byte_data[1:3]
 
             json_data = json.loads(byte_data[4:].decode())
             if 'txpk' in json_data:
                 pkt = json_data['txpk']
-                
-                pkt["json"] = lib_packet.decode_downlink(pkt, conn)
-
+                pkt["json"] = codec.decode_downlink(pkt)
                 logging.info("Received from NS")
                 for line in json.dumps(pkt, indent=4, sort_keys=True).split("\n"):
                     logging.info(line)
 
+                if "error" in pkt["json"]:
+                    continue
+
+                pkt["time"] = time.time()
+                pkt["direction"] = "down"
                 byte_data = bytes([2, random.randint(0, 255), random.randint(0, 255), 6]) + \
                            json.dumps({"txpk": pkt}).encode()
-
                 sock.sendto(byte_data, addr_tc)
-                
+
                 if "fdev" not in pkt:
                     pkt["fdev"] = None
                 if "prea" not in pkt:
                     pkt["prea"] = 8
-
-                conn.execute("INSERT INTO packet \
-                             (tmst, rfch, freq, stat, modu, datr, codr, size, data, \
-                             time, powe, direction, fdev, prea, json, toa) \
-                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                             (pkt['tmst'], pkt['rfch'], pkt['freq'], 0, pkt['modu'], pkt['datr'],
-                              pkt['codr'], pkt['size'], pkt['data'], time.time(), pkt['powe'], 'down', pkt['fdev'],
-                              pkt['prea'], json.dumps(pkt["json"]), get_toa(pkt['size'], pkt['datr'])))
+                pkt["stat"] = 0
                 token = list(byte_data[1:3])
-                conn.execute("INSERT INTO delay (token, time_gen, dst) VALUES (?, ?, ?)",
-                                 ("%02x%02x" % (token[0], token[1]), time.time(), "tc"))
-                conn.commit()
+                if is_test_running:
+                    append_packet(pkt, packets, test_inst_id, conn)
+                    append_delay(token, time_of_arrival, "tc", delays)
             else:
-                token = list(byte_data[1:3])
-                conn.execute("INSERT INTO delay (token, time_gen, dst) VALUES (?, ?, ?)",
-                             ("%02x%02x"%(token[0], token[1]), time.time(), "gw"))
-                conn.commit()
+                if is_test_running:
+                    append_delay(token, time.time(), "gw", delays)
                 sock.sendto(byte_data, addr_pull)
 
             if gw_mac:
@@ -235,127 +334,92 @@ def run_proxy():
                 sock.sendto(byte_data, addr_ns)
             continue
 
-        if list(byte_data)[3] == 5:  # TX_ACK from the gw
+        if msg_type == 5:  # TX_ACK from the gw
             gw_mac_tmp = byte_data[4:12]
             addr_pull = addr
 
             token = list(byte_data[1:3])
-            conn.execute(
-                "UPDATE delay SET time_ack = (?) where rowid = \
-                (SELECT rowid FROM delay WHERE token = (?) AND dst = (?) ORDER BY time_gen DESC LIMIT 1)",
-                (time.time(), "%02x%02x" % (token[0], token[1]), "gw"))
-            conn.commit()
+            if is_test_running:
+                update_delay(token, "gw", delays, test_inst_id, conn)
             continue
 
         # interface for test controller
-        if list(byte_data)[3] == 6:
+        if msg_type == 6:
             json_data = json.loads(byte_data[4:].decode())
 
             if 'rxpk' in json_data:
                 token = list(byte_data[1:3])
-                conn.execute(
-                    "UPDATE delay SET time_ack = (?) where rowid = \
-                    (SELECT rowid FROM delay WHERE token = (?) AND dst = (?) ORDER BY time_gen DESC LIMIT 1)",
-                    (time.time(), "%02x%02x" % (token[0], token[1]), "tc"))
-                conn.commit()
 
                 pkt = json_data["rxpk"]
-
-                if not pkt:
-                    continue
-
                 logging.info("Received from TC, send to NS")
                 for line in json.dumps(pkt, indent=4, sort_keys=True).split("\n"):
                     logging.info(line)
 
+                if not pkt:
+                    continue
 
                 if pkt["size"] < 0:
-                    pkt["data"], pkt["size"] = lib_packet.encode_uplink(pkt["json"], conn)
-
-                if "test" not in pkt:
-                    pkt["test"] = None
+                    pkt["data"], pkt["size"] = codec.encode_uplink(pkt["json"])
 
                 pkt_copy = pkt.copy()
-
-                if "json" in pkt_copy:
-                    del pkt_copy["json"]
-                if "test" in pkt_copy:
-                    del pkt_copy["test"]
+                for key in ("json", "time", "direction"):
+                    if key in pkt_copy:
+                        del pkt_copy[key]
 
                 byte_data = bytes([2, token[0], token[1], 0]) + gw_mac + json.dumps({"rxpk": [pkt_copy]}).encode()
-
                 sock.sendto(byte_data, addr_ns)
 
-                conn.execute("INSERT INTO packet (tmst, chan, rfch, freq, stat, modu, datr, \
-                             codr, lsnr, rssi, size, data, time, direction, json, test, toa) \
-                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                             (pkt['tmst'], pkt['chan'], pkt['rfch'], pkt['freq'], 1, pkt['modu'], pkt['datr'],
-                              pkt['codr'], pkt['lsnr'], pkt['rssi'], pkt['size'], pkt['data'], time.time(), 'up',
-                              json.dumps(pkt["json"]), json.dumps(pkt["test"]), get_toa(pkt['size'], pkt['datr'])))
-                token = list(byte_data[1:3])
-                conn.execute("INSERT INTO delay (token, time_gen, dst) VALUES (?, ?, ?)",
-                             ("%02x%02x" % (token[0], token[1]), time.time(), "ns"))
-                conn.commit()
+                pkt["stat"] = 1
+                pkt["time"] = time.time()
+                pkt["direction"] = "up"
+                if is_test_running:
+                    update_delay(token, "tc", delays, test_inst_id, conn)
+                    append_packet(pkt, packets, test_inst_id, conn)
+                    append_delay(token, pkt["time"], "ns", delays)
 
                 continue
             if 'txpk' in json_data:
                 token = list(byte_data[1:3])
-                conn.execute(
-                    "UPDATE delay SET time_ack = (?) where rowid = \
-                    (SELECT rowid FROM delay WHERE token = (?) AND dst = (?) ORDER BY time_gen DESC LIMIT 1)",
-                    (time.time(), "%02x%02x" % (token[0], token[1]), "tc"))
-                conn.commit()
-                
+
                 if addr_pull:
                     pkt = json_data["txpk"]
-
-                    if not pkt:
-                        continue
-
-                    if json_data["txpk"]["size"] < 0:
-                        pkt["data"], pkt["size"] = lib_packet.encode_downlink(pkt["json"], conn)
-                    
                     logging.info("Received from TC, send to GW")
                     for line in json.dumps(pkt, indent=4, sort_keys=True).split("\n"):
                         logging.info(line)
 
-                    if "test" not in pkt:
-                        pkt["test"] = None
+                    if not pkt:
+                        if is_test_running:
+                            update_delay(token, "tc", delays, test_inst_id, conn)
+                        continue
 
-                    pkt["powe"] = min([pkt["powe"], 21])
+                    if json_data["txpk"]["size"] < 0:
+                        pkt["data"], pkt["size"] = codec.encode_downlink(pkt["json"])
 
+                    pkt["powe"] = min([pkt["powe"], MAX_TX_POWER])
                     pkt_copy = pkt.copy()
+                    for key in ("json", "time", "direction"):
+                        if key in pkt_copy:
+                            del pkt_copy[key]
 
-                    if "json" in pkt_copy:
-                        del pkt_copy["json"]
-                    if "test" in pkt_copy:
-                        del pkt_copy["test"]
-                    if "time" in pkt_copy:
-                        del pkt_copy["time"]
-                        
                     data = json.dumps({"txpk": pkt_copy})
                     byte_data = bytes([2, token[0], token[1], 3]) + data.encode()
                     sock.sendto(byte_data, addr_pull)
-                    
+
                     if "fdev" not in pkt:
                         pkt["fdev"] = None
                     if "prea" not in pkt:
                         pkt["prea"] = 8
-                    conn.execute("INSERT INTO packet \
-                                 (tmst, rfch, freq, stat, modu, datr, codr, size, data, \
-                                 time, powe, direction, fdev, prea, json, test, toa) \
-                                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                 (pkt['tmst'], pkt['rfch'], pkt['freq'], 1, pkt['modu'], pkt['datr'],
-                                  pkt['codr'], pkt['size'], pkt['data'], time.time(), pkt['powe'], 'down', pkt['fdev'],
-                                  pkt['prea'], json.dumps(pkt["json"]), json.dumps(pkt["test"]),
-                                  get_toa(pkt['size'], pkt['datr'])))
-                    token = list(byte_data[1:3])
-                    conn.execute("INSERT INTO delay (token, time_gen, dst) VALUES (?, ?, ?)",
-                                 ("%02x%02x" % (token[0], token[1]), time.time(), "gw"))
-                    conn.commit()
+
+                    pkt["stat"] = 1
+                    pkt["time"] = time.time()
+                    pkt["direction"] = "down"
+                    if is_test_running:
+                        update_delay(token, "tc", delays, test_inst_id, conn)
+                        append_packet(pkt, packets, test_inst_id, conn)
+                        append_delay(token, time.time(), "gw", delays)
                 continue
 
-        logging.error("Error UDP identifier:" + str(byte_data[2]))
+        logging.error("Error UDP identifier:" + str(byte_data[3]))
 
 
 if __name__== "__main__":

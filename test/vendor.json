@@ -1,0 +1,82 @@
+{
+  "vendor": {
+    "CompanyName": "eleven-X Inc.",
+    "Address": "375 Hagey Blvd. Unit 311",
+    "PostalCode": "N2L 6R5",
+    "City": "Waterloo",
+    "Country": "Canada",
+    "URL": "https://eleven-x.com/",
+    "Phone": "1-226-887-0011"
+  },
+  "contact": {
+    "ContactPerson": "Mark Roberts",
+    "Title": "Director, CoE",
+    "Email": "mark.roberts@eleven-x.com",
+    "MobilePhone": "1-613-797-3982"
+  },
+  "product": {
+    "Name": "Meter Interface Unit",
+    "Vertical": "Cities",
+    "Version": "N/A",
+    "Series": "XIU",
+    "HardwareVersion": "N/A",
+    "SoftwareVersion": "N/A",
+    "FirmwareVersion": "F01.06.00",
+    "ADR": 1,
+    "TestSpec": "V1.0.2",
+    "SupportsOTAA": 1,
+    "TestModeAvailable": 0,
+    "DevEUIRange": "[ 70b3b5149fffffff, 70b3b51490000000 ]"
+  },
+  "device": {
+    "DevEui": "70b3b514900b02c6",
+    "AppEui": "70b3b5149e000011",
+    "AppKey": "4881C314B3CBD9FE95957224065A4287",
+    "NwkKey": "4881C314B3CBD9FE95957224065A4287"
+  },
+  "regionSKU": {
+    "PartNumber": "MIU-X",
+    "Region": "US",
+    "US915Using64chForJoinReq": 1,
+    "MaxEIRP": 19.12,
+    "NumTxStep": 11,
+    "TxSteps": "[20, 20, 20, 20, 20, 20, 18, 16.0, 14.0, 12.0, 10.0 ]"
+  },
+  "powerSpec": {
+    "UsableCapacity": 8100.0,
+    "TypicalSelfDischarge": 0.111111111,
+    "MaxDischarge": 0.855,
+    "CurrentSleepMode": 0.007,
+    "MaxPower": 125,
+    "ReplacementVoltage": 3.6
+  },
+  "qrCode": {
+    "QrAvailable": 1,
+    "QRLocation": 0
+  },
+  "upLink": {
+    "PeriodicUpLink": 1,
+    "UpLinksperDay": 24,
+    "UpLinkPeriod": 3600.0,
+    "UpLinkPeriodCustomizable": 1,
+    "UpLinkPeriodCustomReference": "abc"
+  },
+  "joinProcess": {
+    "TransmissionTime1hr": 22.4,
+    "TransmissionTime10hr": 19.2,
+    "TransmissionTime24hr": 12.76
+  },
+  "networkLoss": {
+    "KeepAlive": 0,
+    "KeepAliveReconnect": 0,
+    "ExpectsDownLink": 0,
+    "ExpectsDownLinkReconnect": 0,
+    "ConfirmUpLinkRetries": 64,
+    "ConfirmUpLinkRetriesPeriod": 4.0
+  },
+  "security": {
+    "SupportsJoinServer": 0,
+    "OTAAProcedureDocumented": 0,
+    "OTAAProcedureReference": "Lorawan Specification 1.0.2"
+  }
+}

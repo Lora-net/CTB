@@ -107,7 +107,11 @@ RPI_V2_GPIO_P1_13->RPI_GPIO_P1_13
 #define uint16_t unsigned short
 #define uint32_t unsigned long
 
-
+/* Type safe max macro */
+#define max(a,b) \
+   ({ __typeof__ (a) _a = (a); \
+      __typeof__ (b) _b = (b); \
+      _a > _b ? _a : _b; })
 
 
 typedef enum {FALSE = 0, TRUE = !FALSE} bool;
@@ -379,7 +383,8 @@ void ADS1256_CfgADC(ADS1256_GAIN_E _gain, ADS1256_DRATE_E _drate)
 
         	ACAL=1  enable  calibration
         */
-        buf[0] = (0 << 3) | (1 << 2) | (1 << 1);//enable the internal buffer
+        buf[0] = (0 << 3) | (1 << 2) | (1 << 1);   // enable the internal buffer
+        // [Mark] turn off internal buffer to lower impedance for better noise I hope
         //buf[0] = (0 << 3) | (1 << 2) | (0 << 1);  // The internal buffer is prohibited
 
         //ADS1256_WriteReg(REG_STATUS, (0 << 3) | (1 << 2) | (1 << 1));
@@ -894,6 +899,8 @@ int  main()
     RST_0();
     while(!DRDY_IS_LOW());
 
+    // [Mark] Gain 4 to get 1.25V full scale (2**23-1)
+    // 3750 / 3 = 1250 sps potential
     ADS1256_CfgADC(ADS1256_GAIN_4, ADS1256_3750SPS);
 
     ADS1256_WriteCmd(CMD_SELFOCAL);
@@ -930,6 +937,7 @@ int  main()
     int32_t cal_done[3] = {0, 0, 0};
     int32_t buffer[3] = {0, 0, 0};
     int64_t cal_value[3] = {0, 0, 0};
+    int32_t avg_current = 0;
 
     
     if (!cal) {
@@ -953,54 +961,25 @@ int  main()
             ADS1256_WriteCmd(CMD_SYNC);
             ADS1256_WriteCmd(CMD_WAKEUP);
 
-            volt[ch_index] = ADS1256_ReadData()*100/167/4;
+            // 0 -- 1 ohm, 2 -- 0.1 ohm, 1 -- 0.01 ohm
+            volt[ch_index] = ADS1256_ReadData();
+            // Step 1:  We should have a positive voltage.  Throw away lower 4 bits of noise
+            volt[ch_index] &= ~ (int)((1 << 4) - 1);
 
             bsp_DelayUS(200);
         }
 
-        current[0] = volt[1] * 5 - cal_done[0];
-        current[1] = volt[2] * 50 - cal_done[1];
-        current[2] = volt[0] * 500 - cal_done[2];
+        //printf("Volts (ADC minus Noise): %ld, %ld, %ld.\n", volt[0], volt[2], volt[1]);
 
-        //current0: 6.25mA
-        //current1: 62.5
-        //current2: 625
+        // [Mark] New idea is to calibrate on the voltages and filter out glitches in the voltages
 
-        if(current[1] > 30000000) {
-            combined = current[2];
-        } else if(current[1] < 5000000) {
-            combined = current[0];
-        } else {
-            combined = current[1];
-        }
-
-        buffer[2] = buffer[1];
-        buffer[1] = buffer[0];
-        buffer[0] = combined;
-
-        if (!cal) {
-            if((buffer[1] - buffer[0] > 20000000 && buffer[1] - buffer[2] > 20000000) || (buffer[0] - buffer[1] > 20000000 && buffer[2] - buffer[1] > 20000000)) {
-            } else {
-                fwrite(buffer+1, 4, 1, fp);
-                cnt++;
-            }
-
-            if (lastTime < time(NULL)/log_interval) {
-                printf("Power meter: %ld points saved\n", cnt);
-                cnt = 0;
-                lastTime = time(NULL)/log_interval;
-
-                fclose(fp);
-                sprintf(file_name, "/home/pi/lorawan-conformance-testbench/tmp/power/%d.bin", lastTime);
-                fp = fopen(file_name, "wb");
-            }
-
-        } else {
-            cal_value[0] += current[0];
-            cal_value[1] += current[1];
-            cal_value[2] += current[2];
+        // Step 2: If we are calibrating let's create an average of our noise-free voltages
+        if (cal) {
+            cal_value[0] += volt[0];
+            cal_value[1] += volt[1];
+            cal_value[2] += volt[2];
             cnt++;
-            
+
             if (cnt == 16384)
             {
                 printf("calibration finished\r\n");
@@ -1014,7 +993,7 @@ int  main()
 
                 sprintf(file_name, "/home/pi/lorawan-conformance-testbench/tmp/power/%d.bin", time(NULL)/log_interval);
                 fp = fopen(file_name, "wb");
-                
+
                 fp_cal = fopen(file_name_cal, "r");
                 fscanf(fp_cal, "%d", cal_done);
                 fscanf(fp_cal, "%d", cal_done+1);
@@ -1023,6 +1002,81 @@ int  main()
 
                 cal = 0;
             }
+            continue; // [Mark] force next iteration of while loop if in cal
+        }
+
+        // [Mark] if we got here, we aren't in calibration anymore!
+
+        //printf("Calibrations: %ld, %ld, %ld.\n", cal_done[0], cal_done[2], cal_done[1]);
+
+        // Step 3: Remove offset and scale voltage removing the gains and aajusting for full scale
+        volt[0] = max(volt[0] - cal_done[0], 0) * 100 / 167 / 4; // [Mark] 167 comes from 2 * max of 8388607/100000
+        volt[2] = max(volt[2] - cal_done[2], 0) * 100 / 167 / 4; //        this is compensating for the amp gain of 200
+        volt[1] = max(volt[1] - cal_done[1], 0) * 100 / 167 / 4;
+
+        //printf("Volts (scaled): %ld, %ld, %ld.\n", volt[0], volt[2], volt[1]);
+
+        // Glitch filter just stuffs a fake value from adjacent channel, scaled appropriately
+        // Step 4:  volt[1] > volt[2] > volt[0] or there's trouble!
+        //          also consider valid range of volt 0 since it saturates at 4.5/5 * 1.25 V
+        //          which is around 7.5 million
+        if (volt[0] >= volt[2]) volt[0] = volt[2] / 10;
+        if ((volt[2] >= volt[1]) && (volt[1] < 7500000)) volt[2] = volt[1] / 10;
+        if ((volt[1] < volt[2]) || (volt[1] > 7500000)) volt[1] = volt[2] * 10;
+
+        //printf("Volts (no glitch): %ld, %ld, %ld.\n", volt[0], volt[2], volt[1]);
+
+        // Step 5: Convert our voltages to the equivalent current
+        //          based on the order of the resistors
+        current[2] = volt[0] * 500; // flipped the 500 and 5 multipliers from the original!
+        current[1] = volt[2] * 50;
+        current[0] = volt[1] * 5;
+
+        //printf("Currents (normalized): %ld, %ld, %ld.\n", current[0], current[1], current[2]);
+
+
+
+        // Step 6 (if required): get the currents into shape for recording
+        // the CTB software expects the current to be an integer that needs to be divided by 1,000,000.0 to become a float
+
+        //printf("Currents: %ld, %ld, %ld.\n", current[0], current[1], current[2]);
+
+        // Step 7: Choose the best current for our sample to record
+        //          if we have low or high current measurement choose the appropriate one directly
+        //          because the other values will be suspect
+        if (current[0] < 100000) avg_current = current[0]; // really low current (0.1 mA or 100 uA)
+
+        else if (current[2] > 10000000) avg_current = current[2];  // relatively high current (10mA)
+
+        else {
+        // otherwise: choose the average of the two closest numbers as our sample
+            buffer[0] = abs( current[0] - current[1] );
+            buffer[1] = abs( current[0] - current[2] );
+            buffer[2] = abs( current[1] - current[2] );
+            if (buffer[0] <= buffer[1] && buffer[0] <= buffer[2]) {
+                avg_current = (current[0] + current[1]) / 2;
+                }
+            else if (buffer[1] <= buffer[0] && buffer[1] <= buffer[2]) {
+                avg_current = (current[0] + current[2]) / 2;
+                }
+            else avg_current = (current[1] + current[2]) / 2;
+        }
+
+        //printf("Sample Current: %ld.\n", avg_current);
+
+        // Step 8: write out the sample
+        fwrite(&avg_current, 4, 1, fp);
+        cnt++;
+
+        // Step 9: write out the file if an interval has elapsed and open a new one
+        if (lastTime < time(NULL)/log_interval) {
+            printf("Power meter: %ld points saved\n", cnt);
+            cnt = 0;
+            lastTime = time(NULL)/log_interval;
+
+            fclose(fp);
+            sprintf(file_name, "/home/pi/lorawan-conformance-testbench/tmp/power/%d.bin", lastTime);
+            fp = fopen(file_name, "wb");
         }
     }
 
